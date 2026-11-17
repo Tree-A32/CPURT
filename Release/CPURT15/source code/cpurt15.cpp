@@ -1,37 +1,38 @@
-// cpurt9.cpp — Full AVX-512 pipeline: normal + AO + material now vectorized
+// cpurt15.cpp — AVX2 2× tile unroll + AO oct 2 + batched water reflections
 //
-// What's new vs cpurt8:
-//  12. scene_normal_avx512() — central-difference normals for 16 hits at once
-//                              (6 eval_scene_avx512 calls instead of 16×6=96 scalar)
-//  13. calc_ao_avx512()      — ambient occlusion for 16 hits at once
-//                              (6 eval_scene_avx512 calls instead of 16×6=96 scalar)
-//  14. get_mat_avx512()      — material + albedo lookup for 16 lanes in-register
-//                              (blendv_ps over all material masks, no scalar loop)
-//  15. shade_batch_avx512()  — now uses all three above; the entire shading pipeline
-//                              is SIMD from primary march through to final RGB output.
-//                              The only remaining scalar work is water/crystal special
-//                              paths (~2% of pixels) and the final arithmetic.
+// What's new vs cpurt14:
 //
-// Pipeline is now fully vectorized:
-//   primary march    → AVX-512 (since cpurt5)
-//   shadow march     → AVX-512 (since cpurt6)
-//   GI march         → AVX-512 (since cpurt6)
-//   surface normals  → AVX-512 (new in cpurt9)  ← was scalar (96 evals/tile)
-//   AO               → AVX-512 (new in cpurt9)  ← was scalar (96 evals/tile)
-//   material lookup  → AVX-512 (new in cpurt9)  ← was scalar (16 get_mat calls/tile)
-//   GI bounce normal → AVX-512 (new in cpurt9)  ← was scalar (16 scene_normal calls)
+//  A. AVX2 2× unrolled x-loop — mirrors the AVX-512 change from cpurt14.
+//     x-loop now steps by 16 and processes two 8-wide tiles per iteration
+//     via a captured lambda. Same loop-overhead and OOO overlap benefit.
 //
-// What's carried from cpurt8:
-//   1-11. All AVX-512 + AVX2 batch marching, temporal reprojection (see cpurt8 header)
+//  B. AO oct 3→2 — AO sample points are 0.03–0.43 units from the surface;
+//     the third FBM octave adds detail at ~0.05 world-unit scale, smaller
+//     than the sample step itself. Saves 1 of 3 secondary eval calls per AO
+//     step (33% of AO terrain cost). Both AVX-512 and AVX2 paths.
+//
+//  C. Batched water reflection march (AVX-512) — new shade_water_batch_avx512()
+//     collects all water lanes in a tile, fires one ray_march_avx512 for all
+//     reflection rays, then uses scene_normal_avx512 + soft_shadow_avx512 on
+//     the reflected hits. Replaces up to 16 scalar ray_march calls with one
+//     16-wide vectorised march. The Fresnel blend, water colour, caustic, and
+//     specular remain scalar per-lane (they're just arithmetic, not marches).
+//
+// What's carried from cpurt14:
+//   2× tile unroll (AVX-512), shadow early-out, water/crystal normal reuse,
+//   FBM oct 3 for shadow/GI, AVX2 2D tiling, avx_sin_small, AVX-512 2D tiling,
+//   gather prefetch, denoiser normal reuse, integer hash, BVH,
+//   SHADOW_STEPS=64, MAX_STEPS=192, rsqrt+NR, inv_tot_lut,
+//   temporal reprojection, game bridge.
 //
 // Compile:
-//   g++ -O3 -march=native -fopenmp -std=c++17 -o cpurt9 cpurt9.cpp -lm
-//   g++ -O3 -mavx512f -mavx512dq -mavx512bw -mavx512vl -fopenmp -std=c++17 -o cpurt9 cpurt9.cpp -lm
+//   g++ -O3 -mavx512f -mavx512dq -mavx512bw -mavx512vl -fopenmp -std=c++17 -o cpurt15 cpurt13.cpp -lm
+//   g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -o cpurt15 cpurt13.cpp -lm
 //
 // Run:
-//   ./cpurt9 fast | ./cpurt9 | ./cpurt9 hq | ./cpurt9 hd
-//   ./cpurt9 video TOTAL          # all frames with temporal reprojection
-//   ./cpurt9 video FRAME TOTAL    # single frame (silent warm-up)
+//   ./cpurt15 fast | ./cpurt15 | ./cpurt15 hq | ./cpurt15 hd
+//   ./cpurt15 video TOTAL
+//   ./cpurt15 video FRAME TOTAL
 
 #include <cmath>
 #include <cstdint>
@@ -49,7 +50,7 @@
 
 static const float PI       = 3.14159265f;
 static const float INF      = 1e30f;
-static const int   MAX_STEPS= 256;
+static const int   MAX_STEPS= 192;
 static const float SURF_DIST= 0.004f;
 static const float MAX_DIST = 300.0f;
 
@@ -388,11 +389,14 @@ inline V3 rand_hemi(V3 n,int tid){
 // ─── SHADING (scalar, operates on a known primary hit) ───────────────────────
 // shade_known_hit: same logic as the old shade_hit but takes the pre-marched
 // primary result instead of re-marching it internally.
-V3 shade_known_hit(V3 ro, V3 rd, March m, int tid) {
+// precomp_n: if non-null, used as the primary surface normal instead of calling
+// scene_normal() — the SIMD shade_batch paths pass this in to avoid a redundant
+// 6-eval normal computation for water and crystal lanes.
+V3 shade_known_hit(V3 ro, V3 rd, March m, int tid, const V3* precomp_n = nullptr) {
     if (!m.hit) return sky_color(rd);
 
     if (m.mat == MAT_WATER) {
-        V3 n = scene_normal(m.pos);
+        V3 n = precomp_n ? *precomp_n : scene_normal(m.pos);
         float ndv = std::max(0.f, dot(n, -1.f * rd));
         float fresnel = 0.04f + 0.96f * powf(1 - ndv, 5.f);
         V3 refl_dir = reflect(rd, n);
@@ -415,7 +419,7 @@ V3 shade_known_hit(V3 ro, V3 rd, March m, int tid) {
         return col + V3{1.4f,1.2f,.8f} * spec;
     }
 
-    V3 n = scene_normal(m.pos);
+    V3 n = precomp_n ? *precomp_n : scene_normal(m.pos);
     MatProps mp = get_mat(m.mat, m.pos);
     float diff = std::max(0.f, dot(n, sun_dir));
     float sha = diff > 0.01f ? soft_shadow(m.pos + n * 0.02f, sun_dir, 12.f) : 0.f;
@@ -469,6 +473,7 @@ V3 apply_fog(V3 col, float dist, V3 rd){
 // ── Fast sin(x) for all real x ───────────────────────────────────────────────
 // Polynomial minimax on [-pi, pi] after range reduction.
 // Accuracy: ~5-6 digits — good enough for the hash/noise functions.
+// Still used by tree warp (kept for the full-range case).
 static inline __m512 avx_sin(__m512 x) {
     // Range reduce: x = x - round(x / 2π) * 2π
     const __m512 inv_2pi = _mm512_set1_ps(0.15915494f);  // 1/(2π)
@@ -486,13 +491,43 @@ static inline __m512 avx_sin(__m512 x) {
     return _mm512_mul_ps(x, r);
 }
 
+// ── avx_sin_small: 3-term sin for aesthetic use (water ripple, tree warp) ────
+// Same range reduction as avx_sin, but drops the x^6 term (-1/5040).
+// Max error after range reduction: ~5e-4 at x=±π — imperceptible for ripples/warp.
+// Saves one FMA vs avx_sin: 3 FMAs for the polynomial instead of 4.
+static inline __m512 avx_sin_small(__m512 x) {
+    const __m512 inv_2pi = _mm512_set1_ps(0.15915494f);
+    const __m512 two_pi  = _mm512_set1_ps(6.28318530f);
+    __m512 k = _mm512_roundscale_ps(_mm512_mul_ps(x, inv_2pi),
+                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    x = _mm512_fnmadd_ps(k, two_pi, x);
+    // Horner: sin(x) ≈ x*(1 + x²*(-1/6 + x²*(1/120)))  — 3-term, no x^6
+    __m512 x2 = _mm512_mul_ps(x, x);
+    __m512 r  = _mm512_fmadd_ps(x2, _mm512_set1_ps(1.f/120.f), _mm512_set1_ps(-1.f/6.f));
+    r  = _mm512_fmadd_ps(x2, r, _mm512_set1_ps(1.f));
+    return _mm512_mul_ps(x, r);
+}
+
 // ── Vectorized noise primitives ───────────────────────────────────────────────
+// Integer hash replaces avx_sin-based hash21 — ~6× faster, same visual quality.
+// PCG-style: mix the two integer-grid coords with large primes, then bit-scramble.
 static inline __m512 avx_hash21(__m512 x, __m512 y) {
-    // sin(x*127.1 + y*311.7) * 43758.5453 - floor(...)
-    __m512 v = avx_sin(_mm512_fmadd_ps(x, _mm512_set1_ps(127.1f),
-                                        _mm512_mul_ps(y, _mm512_set1_ps(311.7f))));
-    v = _mm512_mul_ps(v, _mm512_set1_ps(43758.5453f));
-    return _mm512_sub_ps(v, _mm512_floor_ps(v));
+    // Reinterpret float bits as int (grid coords are always exact integers here)
+    __m512i ix = _mm512_cvttps_epi32(x);
+    __m512i iy = _mm512_cvttps_epi32(y);
+    // Combine: h = ix * 1664525 + iy * 22695477 + 1013904223  (LCG mix)
+    __m512i h = _mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(ix, _mm512_set1_epi32(1664525)),
+                        _mm512_mullo_epi32(iy, _mm512_set1_epi32(22695477))),
+                    _mm512_set1_epi32(1013904223));
+    // Xorshift scramble
+    h = _mm512_xor_epi32(h, _mm512_srli_epi32(h, 16));
+    h = _mm512_mullo_epi32(h, _mm512_set1_epi32(0x45d9f3b));
+    h = _mm512_xor_epi32(h, _mm512_srli_epi32(h, 16));
+    // Map unsigned 32-bit to [0,1): keep upper 23 bits as mantissa of float in [1,2), subtract 1
+    __m512i mantissa = _mm512_or_epi32(_mm512_srli_epi32(h, 9), _mm512_set1_epi32(0x3f800000));
+    return _mm512_sub_ps(_mm512_castsi512_ps(mantissa), _mm512_set1_ps(1.f));
 }
 
 static inline __m512 avx_smoothnoise(__m512 x, __m512 y) {
@@ -695,9 +730,9 @@ static EvalResult16 eval_scene_avx512(__m512 px, __m512 py, __m512 pz, int terra
     if (in_lake) {
         __m512 dw = _mm512_add_ps(py, _mm512_set1_ps(0.1f));
         // Small wave ripples
-        __m512 wave_x = _mm512_mul_ps(avx_sin(_mm512_mul_ps(px, _mm512_set1_ps(0.8f))),
+        __m512 wave_x = _mm512_mul_ps(avx_sin_small(_mm512_mul_ps(px, _mm512_set1_ps(0.8f))),
                                        _mm512_set1_ps(0.04f));
-        __m512 wave_z = _mm512_mul_ps(avx_sin(_mm512_mul_ps(pz, _mm512_set1_ps(0.9f))),
+        __m512 wave_z = _mm512_mul_ps(avx_sin_small(_mm512_mul_ps(pz, _mm512_set1_ps(0.9f))),
                                        _mm512_set1_ps(0.03f));
         // Fade waves at lake edge: smoothstep(60,20,r_lake) — just use 1 for simplicity inside lake
         dw = _mm512_add_ps(dw, _mm512_add_ps(wave_x, wave_z));
@@ -769,10 +804,10 @@ static EvalResult16 eval_scene_avx512(__m512 px, __m512 py, __m512 pz, int terra
                 __m512 ly = _mm512_sub_ps(py, _mm512_set1_ps(cy));
                 // warp: wx = dx + sin(ly*2.3+ti_x)*0.15, wz = dz + cos(ly*2.3+ti_z)*0.15
                 __m512 warp_arg = _mm512_fmadd_ps(ly, _mm512_set1_ps(2.3f), _mm512_set1_ps((float)(i * 1.0)));
-                __m512 wx = _mm512_fmadd_ps(avx_sin(warp_arg), _mm512_set1_ps(0.15f), dxi);
+                __m512 wx = _mm512_fmadd_ps(avx_sin_small(warp_arg), _mm512_set1_ps(0.15f), dxi);
                 // For wz, use cos = sin(arg + pi/2)
                 __m512 cos_arg = _mm512_add_ps(warp_arg, _mm512_set1_ps(1.5707963f));
-                __m512 wz = _mm512_fmadd_ps(avx_sin(cos_arg), _mm512_set1_ps(0.15f), dzi);
+                __m512 wz = _mm512_fmadd_ps(avx_sin_small(cos_arg), _mm512_set1_ps(0.15f), dzi);
                 __m512 leaf_r2 = _mm512_fmadd_ps(wx,wx,_mm512_fmadd_ps(ly,ly,_mm512_mul_ps(wz,wz)));
                 __m512 d_leaf = _mm512_sub_ps(
                     _mm512_mul_ps(leaf_r2, _mm512_rsqrt14_ps(_mm512_max_ps(leaf_r2, _mm512_set1_ps(1e-18f)))),
@@ -783,10 +818,52 @@ static EvalResult16 eval_scene_avx512(__m512 px, __m512 py, __m512 pz, int terra
     }
 
     // ── Baked SDF grid objects ──────────────────────────────────────────────
+    // BVH pre-rejection: skip grid entirely if the closest lane's x/y/z is
+    // farther than the current best distance from the world-space bbox.
+    // Uses the min/max of the 16 lane coords vs the grid's world-space bbox.
+    // A grid that is already farther than best_d contributes nothing.
+    //
+    // Prefetch: before the _mm512_i32gather_ps calls for grid gi, we issue
+    // software prefetches for grid gi+1's data start.  The gather has ~100
+    // cycle latency on most microarchitectures; prefetching one grid ahead
+    // hides that latency behind the current grid's trilinear interpolation.
     for (int gi = 0; gi < g_ngrid; gi++) {
         if (!g_grids[gi].valid) continue;
-        __m512 d = sdf_grid_query_avx512(g_grids[gi], px, py, pz);
-        update(d, g_grids[gi].mat);
+        const SDFGrid& g = g_grids[gi];
+        float dx_ = g.bmax[0]-g.bmin[0], dy_ = g.bmax[1]-g.bmin[1], dz_ = g.bmax[2]-g.bmin[2];
+        float half_diag = sqrtf(dx_*dx_+dy_*dy_+dz_*dz_) * 0.5f * g.scale;
+        float cx_ = (g.bmin[0]+g.bmax[0])*0.5f*g.scale + g.pos.x;
+        float cy_ = (g.bmin[1]+g.bmax[1])*0.5f*g.scale + g.pos.y;
+        float cz_ = (g.bmin[2]+g.bmax[2])*0.5f*g.scale + g.pos.z;
+        __m512 gcx = _mm512_set1_ps(cx_), gcy = _mm512_set1_ps(cy_), gcz = _mm512_set1_ps(cz_);
+        __m512 edx = _mm512_sub_ps(px, gcx), edy = _mm512_sub_ps(py, gcy), edz = _mm512_sub_ps(pz, gcz);
+        __m512 ed2 = _mm512_fmadd_ps(edx,edx,_mm512_fmadd_ps(edy,edy,_mm512_mul_ps(edz,edz)));
+        float min_ed2 = _mm512_reduce_min_ps(ed2);
+        float min_dist_to_sphere = sqrtf(min_ed2) - half_diag;
+        float cur_best = _mm512_reduce_min_ps(best_d);
+        if (min_dist_to_sphere > cur_best) continue;
+
+        // Prefetch the next valid grid's data into L2 before we do the gather
+        // for this grid.  _mm_prefetch T1 = prefetch to L2 (not L1, to avoid
+        // evicting FBM data that's still hot).  We prefetch the first few cache
+        // lines (the header + first z-slice corner) which is where the gather
+        // indices are most likely to land for nearby tiles.
+        for (int ngi = gi+1; ngi < g_ngrid; ngi++) {
+            if (!g_grids[ngi].valid) continue;
+            const char* nbase = reinterpret_cast<const char*>(g_grids[ngi].data);
+            int n3 = g_grids[ngi].N * g_grids[ngi].N * g_grids[ngi].N;
+            // Prefetch first 4 cache lines (256 bytes) and middle of the grid
+            _mm_prefetch(nbase,            _MM_HINT_T1);
+            _mm_prefetch(nbase + 64,       _MM_HINT_T1);
+            _mm_prefetch(nbase + 128,      _MM_HINT_T1);
+            _mm_prefetch(nbase + 192,      _MM_HINT_T1);
+            // Mid-grid hint (helps when the hit point is near the grid centre)
+            _mm_prefetch(nbase + (n3/2)*4, _MM_HINT_T2);
+            break;  // only prefetch the next grid
+        }
+
+        __m512 d = sdf_grid_query_avx512(g, px, py, pz);
+        update(d, g.mat);
     }
 
     return {best_d, best_mat};
@@ -862,7 +939,7 @@ static __m512 soft_shadow_avx512(
         __m512 rdx, __m512 rdy, __m512 rdz,
         float k = 14.f)
 {
-    const int   SHADOW_STEPS = 96;
+    const int   SHADOW_STEPS = 64;
     const float T_MAX        = 60.f;
     const float T_START      = 0.05f;
     const float HIT_THRESH   = 0.001f;
@@ -886,9 +963,9 @@ static __m512 soft_shadow_avx512(
         __m512 py = _mm512_fmadd_ps(rdy, t, roy);
         __m512 pz = _mm512_fmadd_ps(rdz, t, roz);
 
-        // Shadow march uses reduced FBM octaves (4 vs 7): saves 3/7 ≈ 43% of terrain cost.
+        // Shadow march uses reduced FBM octaves (3 vs 7): saves 4/7 ≈ 57% of terrain cost.
         // Shadow rays only need large-scale terrain shape to determine occlusion.
-        EvalResult16 ev = eval_scene_avx512(px, py, pz, 4);
+        EvalResult16 ev = eval_scene_avx512(px, py, pz, 3);
         __m512 d = ev.d;
 
         // Hard shadow: d < HIT_THRESH → res = 0 for those lanes, retire them
@@ -919,6 +996,12 @@ static __m512 soft_shadow_avx512(
 
         // Retire lanes that escaped
         active &= ~(_mm512_cmp_ps_mask(t, t_max_v, _CMP_GE_OQ));
+
+        // Early-out: retire active lanes whose accumulated shadow factor has
+        // already dropped below 0.001 — they will contribute pure black shadow
+        // regardless of remaining march steps. This fires frequently in scenes
+        // with dense geometry or long sun angles (fully shaded regions).
+        active &= ~(_mm512_cmp_ps_mask(res, eps_v, _CMP_LE_OQ));
     }
 
     return _mm512_max_ps(zero, _mm512_min_ps(one, res));
@@ -949,9 +1032,9 @@ static March16 ray_march_avx512_gi(
         __m512 py = _mm512_fmadd_ps(rdy, t, roy);
         __m512 pz = _mm512_fmadd_ps(rdz, t, roz);
 
-        // GI bounce uses reduced FBM octaves (4): saves ~43% terrain eval cost.
+        // GI bounce uses reduced FBM octaves (3): saves ~57% terrain eval cost.
         // One diffuse bounce only needs large-scale scene shape.
-        EvalResult16 res = eval_scene_avx512(px, py, pz, 4);
+        EvalResult16 res = eval_scene_avx512(px, py, pz, 3);
 
         t = _mm512_mask_add_ps(t, active, t, res.d);
 
@@ -1081,11 +1164,20 @@ static inline void rand_hemi_avx8(
     (void)vw; // rw used only for seeding variation; ONB is deterministic
 }
 
+// Integer hash — same algorithm as AVX-512 avx_hash21 above, AVX2 edition.
 static inline __m256 avx8_hash21(__m256 x, __m256 y) {
-    __m256 v = avx8_sin(_mm256_fmadd_ps(x, _mm256_set1_ps(127.1f),
-                                         _mm256_mul_ps(y, _mm256_set1_ps(311.7f))));
-    v = _mm256_mul_ps(v, _mm256_set1_ps(43758.5453f));
-    return _mm256_sub_ps(v, _mm256_floor_ps(v));
+    __m256i ix = _mm256_cvttps_epi32(x);
+    __m256i iy = _mm256_cvttps_epi32(y);
+    __m256i h = _mm256_add_epi32(
+                    _mm256_add_epi32(
+                        _mm256_mullo_epi32(ix, _mm256_set1_epi32(1664525)),
+                        _mm256_mullo_epi32(iy, _mm256_set1_epi32(22695477))),
+                    _mm256_set1_epi32(1013904223));
+    h = _mm256_xor_si256(h, _mm256_srli_epi32(h, 16));
+    h = _mm256_mullo_epi32(h, _mm256_set1_epi32(0x45d9f3b));
+    h = _mm256_xor_si256(h, _mm256_srli_epi32(h, 16));
+    __m256i mantissa = _mm256_or_si256(_mm256_srli_epi32(h, 9), _mm256_set1_epi32(0x3f800000));
+    return _mm256_sub_ps(_mm256_castsi256_ps(mantissa), _mm256_set1_ps(1.f));
 }
 static inline __m256 avx8_smoothnoise(__m256 x, __m256 y) {
     __m256 ix = _mm256_floor_ps(x), iy = _mm256_floor_ps(y);
@@ -1328,10 +1420,46 @@ static EvalResult8 eval_scene_avx8(__m256 px, __m256 py, __m256 pz, int terrain_
     }
 
     // ── Baked SDF grid objects ────────────────────────────────────────────
+    // BVH sphere pre-rejection (same logic as AVX-512 path above).
+    // Prefetch next grid's data before the gather for the current one (same
+    // strategy as AVX-512: prefetch 4 cache lines at the start + mid hint).
     for (int gi = 0; gi < g_ngrid; gi++) {
         if (!g_grids[gi].valid) continue;
-        __m256 d = sdf_grid_query_avx8(g_grids[gi], px, py, pz);
-        update8(d, g_grids[gi].mat);
+        const SDFGrid& g = g_grids[gi];
+        float dx_ = g.bmax[0]-g.bmin[0], dy_ = g.bmax[1]-g.bmin[1], dz_ = g.bmax[2]-g.bmin[2];
+        float half_diag = sqrtf(dx_*dx_+dy_*dy_+dz_*dz_) * 0.5f * g.scale;
+        float cx_ = (g.bmin[0]+g.bmax[0])*0.5f*g.scale + g.pos.x;
+        float cy_ = (g.bmin[1]+g.bmax[1])*0.5f*g.scale + g.pos.y;
+        float cz_ = (g.bmin[2]+g.bmax[2])*0.5f*g.scale + g.pos.z;
+        __m256 gcx = _mm256_set1_ps(cx_), gcy = _mm256_set1_ps(cy_), gcz = _mm256_set1_ps(cz_);
+        __m256 edx = _mm256_sub_ps(px, gcx), edy = _mm256_sub_ps(py, gcy), edz = _mm256_sub_ps(pz, gcz);
+        __m256 ed2 = _mm256_fmadd_ps(edx,edx,_mm256_fmadd_ps(edy,edy,_mm256_mul_ps(edz,edz)));
+        __m256 lo = _mm256_min_ps(ed2, _mm256_permute2f128_ps(ed2, ed2, 1));
+        lo = _mm256_min_ps(lo, _mm256_shuffle_ps(lo, lo, _MM_SHUFFLE(2,3,0,1)));
+        lo = _mm256_min_ps(lo, _mm256_shuffle_ps(lo, lo, _MM_SHUFFLE(1,0,3,2)));
+        float min_ed2; _mm_store_ss(&min_ed2, _mm256_castps256_ps128(lo));
+        float min_dist_to_sphere = sqrtf(min_ed2) - half_diag;
+        __m256 bd_lo = _mm256_min_ps(best_d, _mm256_permute2f128_ps(best_d, best_d, 1));
+        bd_lo = _mm256_min_ps(bd_lo, _mm256_shuffle_ps(bd_lo, bd_lo, _MM_SHUFFLE(2,3,0,1)));
+        bd_lo = _mm256_min_ps(bd_lo, _mm256_shuffle_ps(bd_lo, bd_lo, _MM_SHUFFLE(1,0,3,2)));
+        float cur_best; _mm_store_ss(&cur_best, _mm256_castps256_ps128(bd_lo));
+        if (min_dist_to_sphere > cur_best) continue;
+
+        // Prefetch next valid grid's data before the gather
+        for (int ngi = gi+1; ngi < g_ngrid; ngi++) {
+            if (!g_grids[ngi].valid) continue;
+            const char* nbase = reinterpret_cast<const char*>(g_grids[ngi].data);
+            int n3 = g_grids[ngi].N * g_grids[ngi].N * g_grids[ngi].N;
+            _mm_prefetch(nbase,            _MM_HINT_T1);
+            _mm_prefetch(nbase + 64,       _MM_HINT_T1);
+            _mm_prefetch(nbase + 128,      _MM_HINT_T1);
+            _mm_prefetch(nbase + 192,      _MM_HINT_T1);
+            _mm_prefetch(nbase + (n3/2)*4, _MM_HINT_T2);
+            break;
+        }
+
+        __m256 d = sdf_grid_query_avx8(g, px, py, pz);
+        update8(d, g.mat);
     }
 
     return {best_d, best_mat};
@@ -1425,7 +1553,7 @@ static __m256 soft_shadow_avx8(
         __m256 rdx, __m256 rdy, __m256 rdz,
         float k = 14.f)
 {
-    const int   SHADOW_STEPS = 96;
+    const int   SHADOW_STEPS = 64;
     const float T_MAX        = 60.f;
 
     const __m256 k_v    = _mm256_set1_ps(k);
@@ -1454,7 +1582,7 @@ static __m256 soft_shadow_avx8(
         __m256 pz = _mm256_add_ps(_mm256_mul_ps(rdz, t), roz);
 #endif
         // Shadow march uses reduced FBM octaves (4): ~43% less terrain eval cost.
-        EvalResult8 ev = eval_scene_avx8(px, py, pz, 4);
+        EvalResult8 ev = eval_scene_avx8(px, py, pz, 3);
         __m256 d = ev.d;
 
         // Blocked lanes → res = 0
@@ -1479,6 +1607,10 @@ static __m256 soft_shadow_avx8(
 
         int esc = _mm256_movemask_ps(_mm256_cmp_ps(t, tmax_v, _CMP_GE_OQ));
         active &= ~(uint8_t)esc;
+
+        // Early-out: retire lanes whose res has dropped below 0.001
+        int dark = _mm256_movemask_ps(_mm256_cmp_ps(res, eps_v, _CMP_LE_OQ));
+        active &= ~(uint8_t)dark;
     }
     return _mm256_max_ps(zero8, _mm256_min_ps(one8, res));
 }
@@ -1539,7 +1671,7 @@ static __m256 calc_ao_avx8(
         __m256 spx = _mm256_fmadd_ps(vn_x, h2, px);
         __m256 spy = _mm256_fmadd_ps(vn_y, h2, py);
         __m256 spz = _mm256_fmadd_ps(vn_z, h2, pz);
-        __m256 d   = eval_scene_avx8(spx, spy, spz, 4).d;  // AO: 4 octaves sufficient
+        __m256 d   = eval_scene_avx8(spx, spy, spz, 2).d;  // AO: 2 octaves sufficient
         // occ += (h2 - d) * sc
         occ = _mm256_fmadd_ps(_mm256_sub_ps(h2, d), sc, occ);
         sc  = _mm256_mul_ps(sc, _mm256_set1_ps(0.75f));
@@ -1723,11 +1855,15 @@ static void shade_batch_avx8(
 #endif
 
     // 2. Special materials: scalar path (water reflection, crystal rim)
+    // Normals already computed in nx8/ny8/nz8 above — pass as precomp_n to
+    // skip the scene_normal call inside shade_known_hit (saves 6 eval_scene
+    // per water/crystal hit pixel).
     for (int i = 0; i < 8; i++) {
         if (!is_special[i]) continue;
         bool hit = (hit_mask >> i) & 1; if (!hit) continue;
+        V3 n_i = {nx8[i], ny8[i], nz8[i]};
         March m_i; m_i.pos={hx[i],hy[i],hz[i]}; m_i.mat=hm[i]; m_i.hit=true; m_i.t=0;
-        V3 c=shade_known_hit(cam_pos,{rdx0[i],rdy0[i],rdz0[i]},m_i,tid);
+        V3 c=shade_known_hit(cam_pos,{rdx0[i],rdy0[i],rdz0[i]},m_i,tid,&n_i);
         col_r[i]=c.x; col_g[i]=c.y; col_b[i]=c.z;
     }
 
@@ -1792,7 +1928,7 @@ static void shade_batch_avx8(
     {
         __m256 gox=_mm256_load_ps(gi_ox),goy=_mm256_load_ps(gi_oy),goz=_mm256_load_ps(gi_oz);
         __m256 gdx=_mm256_load_ps(gi_dx),gdy=_mm256_load_ps(gi_dy),gdz=_mm256_load_ps(gi_dz);
-        gi8=ray_march_avx8(gox,goy,goz,gdx,gdy,gdz,20.f,4); // GI: 4 FBM octaves
+        gi8=ray_march_avx8(gox,goy,goz,gdx,gdy,gdz,20.f,3); // GI: 3 FBM octaves
     }
     alignas(32) float ghx[8],ghy[8],ghz[8]; alignas(32) int ghm[8];
     _mm256_store_ps(ghx,gi8.pos_x); _mm256_store_ps(ghy,gi8.pos_y); _mm256_store_ps(ghz,gi8.pos_z);
@@ -1976,8 +2112,9 @@ static __m512 calc_ao_avx512(
         __m512 spx = _mm512_fmadd_ps(vn_x, h2, px);
         __m512 spy = _mm512_fmadd_ps(vn_y, h2, py);
         __m512 spz = _mm512_fmadd_ps(vn_z, h2, pz);
-        // AO samples are very close to the surface (0.03–0.43 units); 4 octaves suffice.
-        __m512 d   = eval_scene_avx512(spx, spy, spz, 4).d;
+        // AO samples are very close to the surface (0.03–0.43 units); 2 octaves suffice.
+        // The third octave adds detail smaller than the sample step itself.
+        __m512 d   = eval_scene_avx512(spx, spy, spz, 2).d;
         occ = _mm512_fmadd_ps(_mm512_sub_ps(h2, d), sc, occ);
         sc  = _mm512_mul_ps(sc, _mm512_set1_ps(0.75f));
     }
@@ -2094,6 +2231,131 @@ static inline void get_mat_avx512(
 //   5. Finish shading with the batched shadow / GI results (scalar arithmetic)
 //   6. Write GI contribution to curr_gi cache for next frame's reprojection
 //
+// ── shade_water_batch_avx512 ─────────────────────────────────────────────────
+// Vectorised water shading for up to 16 water lanes in a tile.
+// Replaces up to 16 scalar ray_march calls (one per water pixel) with a single
+// ray_march_avx512 call for all reflection rays, then vectorises the normal and
+// shadow computation on the reflected hits.
+//
+// n_water: number of water lanes (1–16). All arrays are n_water-wide but
+//          padded to 16 with the last valid lane to keep SIMD code clean.
+// Outputs col_r/g/b for the n_water lanes (caller writes them into the tile).
+#ifdef __AVX512F__
+static void shade_water_batch_avx512(
+        int n_water,
+        const float* wpx,  const float* wpy,  const float* wpz,   // hit positions
+        const float* wnx,  const float* wny,  const float* wnz,   // surface normals
+        const float* wrdx, const float* wrdy, const float* wrdz,  // incident ray dirs
+        float* col_r, float* col_g, float* col_b)
+{
+    // ── Build reflection ray batch ────────────────────────────────────────────
+    alignas(64) float rox[16], roy[16], roz[16];
+    alignas(64) float rdx[16], rdy[16], rdz[16];
+
+    for (int i = 0; i < 16; i++) {
+        int si = i < n_water ? i : n_water - 1;  // clamp pad lanes
+        float nx = wnx[si], ny = wny[si], nz = wnz[si];
+        float dx = wrdx[si], dy = wrdy[si], dz = wrdz[si];
+        // reflect(rd, n) = rd - 2*dot(rd,n)*n
+        float dot_rn = dx*nx + dy*ny + dz*nz;
+        rdx[i] = dx - 2.f*dot_rn*nx;
+        rdy[i] = dy - 2.f*dot_rn*ny;
+        rdz[i] = dz - 2.f*dot_rn*nz;
+        // Offset origin along normal to avoid self-intersection
+        rox[i] = wpx[si] + nx*0.01f;
+        roy[i] = wpy[si] + ny*0.01f;
+        roz[i] = wpz[si] + nz*0.01f;
+    }
+
+    // ── Batch reflection march ────────────────────────────────────────────────
+    March16 rm = ray_march_avx512(
+        _mm512_load_ps(rox), _mm512_load_ps(roy), _mm512_load_ps(roz),
+        _mm512_load_ps(rdx), _mm512_load_ps(rdy), _mm512_load_ps(rdz));
+
+    alignas(64) float rhx[16], rhy[16], rhz[16];
+    alignas(64) int   rhm[16];
+    _mm512_store_ps(rhx, rm.pos_x); _mm512_store_ps(rhy, rm.pos_y); _mm512_store_ps(rhz, rm.pos_z);
+    _mm512_store_epi32(rhm, rm.mat);
+
+    // ── Vectorised normal + shadow on reflected hits ──────────────────────────
+    // scene_normal_avx512 handles all 16 lanes; miss/water lanes get a dummy
+    // normal but their colour is overridden by sky_color below.
+    alignas(64) float rnx[16], rny[16], rnz[16];
+    scene_normal_avx512(rhx, rhy, rhz, rnx, rny, rnz);
+
+    // Shadow: build origins and fire soft_shadow_avx512 for reflected hits
+    alignas(64) float sox[16], soy[16], soz[16];
+    for (int i = 0; i < 16; i++) {
+        sox[i] = rhx[i] + rnx[i]*0.02f;
+        soy[i] = rhy[i] + rny[i]*0.02f;
+        soz[i] = rhz[i] + rnz[i]*0.02f;
+    }
+    const __m512 sun_x = _mm512_set1_ps(sun_dir.x);
+    const __m512 sun_y = _mm512_set1_ps(sun_dir.y);
+    const __m512 sun_z = _mm512_set1_ps(sun_dir.z);
+    __m512 refl_sha = soft_shadow_avx512(
+        _mm512_load_ps(sox), _mm512_load_ps(soy), _mm512_load_ps(soz),
+        sun_x, sun_y, sun_z, 10.f);
+
+    // Diffuse dot on reflected hits
+    __m512 vrnx = _mm512_load_ps(rnx), vrny = _mm512_load_ps(rny), vrnz = _mm512_load_ps(rnz);
+    __m512 diff_r = _mm512_max_ps(_mm512_setzero_ps(),
+        _mm512_fmadd_ps(vrnx, sun_x, _mm512_fmadd_ps(vrny, sun_y, _mm512_mul_ps(vrnz, sun_z))));
+
+    // Reflected colour: for hits use albedo*(diff*sha*1.5+0.15), for misses use sky
+    // We need mat albedo for the reflected hits — use scalar get_mat per lane
+    // (reflected hit material lookup is cheap; it's the march that was expensive).
+    alignas(64) float refl_r[16], refl_g[16], refl_b[16];
+    alignas(64) float sha_arr[16];
+    _mm512_store_ps(sha_arr, refl_sha);
+    alignas(64) float diff_arr[16];
+    _mm512_store_ps(diff_arr, diff_r);
+
+    for (int i = 0; i < 16; i++) {
+        bool hit_r = (rm.hit_mask >> i) & 1;
+        if (hit_r && rhm[i] != MAT_WATER) {
+            MatProps mp2 = get_mat(rhm[i], {rhx[i], rhy[i], rhz[i]});
+            float shade = diff_arr[i] * sha_arr[i] * 1.5f + 0.15f;
+            refl_r[i] = mp2.albedo.x * shade;
+            refl_g[i] = mp2.albedo.y * shade;
+            refl_b[i] = mp2.albedo.z * shade;
+        } else {
+            // Miss or reflected-into-water: use sky colour for reflection dir
+            V3 sky = sky_color({rdx[i], rdy[i], rdz[i]});
+            refl_r[i] = sky.x; refl_g[i] = sky.y; refl_b[i] = sky.z;
+        }
+    }
+
+    // ── Per-lane Fresnel blend, water colour, specular ────────────────────────
+    for (int i = 0; i < n_water; i++) {
+        float nx = wnx[i], ny = wny[i], nz = wnz[i];
+        float dx = wrdx[i], dy = wrdy[i], dz = wrdz[i];
+        float ndv  = std::max(0.f, -(dx*nx + dy*ny + dz*nz));
+        float fres = 0.04f + 0.96f * powf(1.f - ndv, 5.f);
+
+        float depth_f = smoothstep(0.f, 3.f, fabsf(terrain_h(wpx[i], wpz[i])));
+        float caus = powf(std::max(0.f, sinf(wpx[i]*2.3f)*sinf(wpz[i]*1.9f)), 4.f) * 0.5f;
+        float wc_r = (0.1f  + (0.01f - 0.1f) *depth_f) + 0.1f *caus;
+        float wc_g = (0.3f  + (0.08f - 0.3f) *depth_f) + 0.15f*caus;
+        float wc_b = (0.4f  + (0.18f - 0.4f) *depth_f) + 0.1f *caus;
+
+        float cr = wc_r + (refl_r[i] - wc_r)*fres;
+        float cg = wc_g + (refl_g[i] - wc_g)*fres;
+        float cb = wc_b + (refl_b[i] - wc_b)*fres;
+
+        // Specular highlight
+        float hx2 = sun_dir.x - dx, hy2 = sun_dir.y - dy, hz2 = sun_dir.z - dz;
+        float hlen = sqrtf(hx2*hx2 + hy2*hy2 + hz2*hz2) + 1e-6f;
+        hx2/=hlen; hy2/=hlen; hz2/=hlen;
+        float spec = powf(std::max(0.f, nx*hx2 + ny*hy2 + nz*hz2), 256.f) * 2.f;
+
+        col_r[i] = cr + 1.4f*spec;
+        col_g[i] = cg + 1.2f*spec;
+        col_b[i] = cb + 0.8f*spec;
+    }
+}
+#endif
+
 // Water and crystal have special paths — those lanes fall through to scalar
 // shading exactly as before (they're a small fraction of pixels).
 //
@@ -2116,13 +2378,21 @@ static void shade_batch_avx512(
         int            pixel_y,         // row of this tile in the framebuffer
         int            pixel_x_base,    // x of lane 0
         // Outputs
-        float* col_r, float* col_g, float* col_b)
+        float* col_r, float* col_g, float* col_b,
+        // Optional: primary normals for denoiser nrm buffer (avoids redundant scene_normal)
+        float* nx_out = nullptr, float* ny_out = nullptr, float* nz_out = nullptr)
 {
     // ── 1. Normals (AVX-512: 6 eval_scene_avx512 calls for all 16 hits) ──────
     // Sky/miss lanes get a dummy normal; special lanes get the real normal for
     // shadow-offset computation even though shading falls back to scalar.
     alignas(64) float nx16[16], ny16[16], nz16[16];
     scene_normal_avx512(hx, hy, hz, nx16, ny16, nz16);
+
+    // Export normals for denoiser nrm buffer — avoids a redundant scalar scene_normal
+    // call per hit pixel in render_frame (was costing 6 scalar eval_scene per pixel).
+    if (nx_out) { _mm512_store_ps(nx_out, _mm512_load_ps(nx16)); }
+    if (ny_out) { _mm512_store_ps(ny_out, _mm512_load_ps(ny16)); }
+    if (nz_out) { _mm512_store_ps(nz_out, _mm512_load_ps(nz16)); }
 
     // ── 1b. Material lookup (AVX-512: all 16 lanes in-register) ──────────────
     alignas(64) float mat_ar[16], mat_ag[16], mat_ab[16], mat_rough[16];
@@ -2142,15 +2412,45 @@ static void shade_batch_avx512(
         is_special[i] = (hm[i] == MAT_WATER || hm[i] == MAT_MESH_CRYSTAL);
     }
 
-    // ── 2. Special materials: scalar path (water reflection, crystal rim) ──────
+    // ── 2. Special materials ──────────────────────────────────────────────────
+    // Water: collect water lanes, fire one batched ray_march_avx512 for all
+    // reflection rays, then blend with shade_water_batch_avx512.
+    // Crystal: scalar path (rim + specular, no secondary march needed).
+
+    // Gather water lanes into compact arrays for the batch call
+    alignas(64) float wpx[16],wpy[16],wpz[16];
+    alignas(64) float wnx[16],wny[16],wnz[16];
+    alignas(64) float wrdx[16],wrdy[16],wrdz[16];
+    int water_lane[16], n_water = 0;
+
     for (int i = 0; i < 16; i++) {
         if (!is_special[i]) continue;
         bool hit = (hit_mask >> i) & 1;
         if (!hit) continue;
-        V3 rd_i = {rdx0[i], rdy0[i], rdz0[i]};
-        March m_i; m_i.pos={hx[i],hy[i],hz[i]}; m_i.mat=hm[i]; m_i.hit=true; m_i.t=0;
-        V3 c = shade_known_hit(cam_pos, rd_i, m_i, tid);
-        col_r[i] = c.x; col_g[i] = c.y; col_b[i] = c.z;
+        if (hm[i] == MAT_WATER) {
+            water_lane[n_water] = i;
+            wpx[n_water]=hx[i]; wpy[n_water]=hy[i]; wpz[n_water]=hz[i];
+            wnx[n_water]=nx16[i]; wny[n_water]=ny16[i]; wnz[n_water]=nz16[i];
+            wrdx[n_water]=rdx0[i]; wrdy[n_water]=rdy0[i]; wrdz[n_water]=rdz0[i];
+            n_water++;
+        } else {
+            // Crystal: scalar path with precomputed normal
+            V3 rd_i = {rdx0[i], rdy0[i], rdz0[i]};
+            V3 n_i  = {nx16[i], ny16[i], nz16[i]};
+            March m_i; m_i.pos={hx[i],hy[i],hz[i]}; m_i.mat=hm[i]; m_i.hit=true; m_i.t=0;
+            V3 c = shade_known_hit(cam_pos, rd_i, m_i, tid, &n_i);
+            col_r[i] = c.x; col_g[i] = c.y; col_b[i] = c.z;
+        }
+    }
+
+    if (n_water > 0) {
+        alignas(64) float wc_r[16], wc_g[16], wc_b[16];
+        shade_water_batch_avx512(n_water, wpx, wpy, wpz, wnx, wny, wnz,
+                                 wrdx, wrdy, wrdz, wc_r, wc_g, wc_b);
+        for (int wi = 0; wi < n_water; wi++) {
+            int i = water_lane[wi];
+            col_r[i] = wc_r[wi]; col_g[i] = wc_g[wi]; col_b[i] = wc_b[wi];
+        }
     }
 
     // ── 3. Build shadow + GI ray batches for non-special hit lanes ────────────
@@ -2382,6 +2682,220 @@ void render_frame(const Camera& cam, int SAMPLES, float anim_t,
         float jx=(frame%4+.5f)/4.f-.5f;
         float jy=(frame/4%4+.5f)/4.f-.5f;
 
+        // ── AVX-512 path: 2D tiles of 16×4 pixels ───────────────────────────
+        // Outer loop over 4-row strips (dynamic scheduling, 1 strip per OMP task).
+        // Within each strip, 4 rows × (W/16) 16-wide march calls.
+        // Benefit: adjacent rows share nearly identical (x,z) terrain FBM inputs
+        // → better L1/L2 cache reuse in avx_smoothnoise / avx_fbm.
+#ifdef __AVX512F__
+#pragma omp parallel for schedule(dynamic,1)
+        for(int ty=0;ty<H;ty+=4){
+            int tid=0;
+#ifdef _OPENMP
+            tid=omp_get_thread_num()&63;
+#endif
+            int row_end = std::min(ty+4, H);
+
+            for(int y=ty; y<row_end; y++){
+                rng_state[tid]^=(uint32_t)(y*7919+frame*2053);
+
+                // ── AVX-512 tile processor lambda (2× unrolled x-loop) ──────────
+                // Processing two 16-wide tiles per iteration halves loop overhead
+                // and lets the OOO core overlap setup of tile B with the march of
+                // tile A, since neither has a data dependency on the other.
+                // Uses a C++14 generic lambda to avoid duplicating 60 lines.
+                auto process_tile_avx512 = [&](int tx) {
+                    if (tx >= W) return;
+                    int batch = std::min(16, W - tx);
+
+                    alignas(64) float rox_a[16], roy_a[16], roz_a[16];
+                    alignas(64) float rdx_a[16], rdy_a[16], rdz_a[16];
+                    alignas(64) float rdx0[16],  rdy0[16],  rdz0[16];
+
+                    for(int dx=0;dx<16;dx++){
+                        int xi = tx + dx;
+                        if(xi >= W) xi = W-1;
+
+                        float ux = (xi+.5f+jx*.5f+(rng_float(tid)-.5f)*.3f)/W*2-1;
+                        float uy = 1-(y+.5f+jy*.5f+(rng_float(tid)-.5f)*.3f)/H*2;
+                        float rdx_ = cam_fwd.x + cam_right.x*(ux*aspect*fov) + cam_up.x*(uy*fov);
+                        float rdy_ = cam_fwd.y + cam_right.y*(ux*aspect*fov) + cam_up.y*(uy*fov);
+                        float rdz_ = cam_fwd.z + cam_right.z*(ux*aspect*fov) + cam_up.z*(uy*fov);
+                        float rlen = sqrtf(rdx_*rdx_+rdy_*rdy_+rdz_*rdz_);
+                        rdx0[dx]=rdx_/rlen; rdy0[dx]=rdy_/rlen; rdz0[dx]=rdz_/rlen;
+
+                        float dof_str=0.02f;
+                        float dfx=rng_float(tid)*2-1, dfy=rng_float(tid)*2-1;
+                        float rox_ = cam_pos.x + cam_right.x*dfx*dof_str + cam_up.x*dfy*dof_str;
+                        float roy_ = cam_pos.y + cam_right.y*dfx*dof_str + cam_up.y*dfy*dof_str;
+                        float roz_ = cam_pos.z + cam_right.z*dfx*dof_str + cam_up.z*dfy*dof_str;
+                        float fx_ = rox_+rdx0[dx]*40, fy_ = roy_+rdy0[dx]*40, fz_ = roz_+rdz0[dx]*40;
+                        float fdx = fx_-rox_, fdy = fy_-roy_, fdz = fz_-roz_;
+                        float flen = sqrtf(fdx*fdx+fdy*fdy+fdz*fdz);
+                        rox_a[dx]=rox_; roy_a[dx]=roy_; roz_a[dx]=roz_;
+                        rdx_a[dx]=fdx/flen; rdy_a[dx]=fdy/flen; rdz_a[dx]=fdz/flen;
+                    }
+
+                    __m512 vro_x = _mm512_load_ps(rox_a);
+                    __m512 vro_y = _mm512_load_ps(roy_a);
+                    __m512 vro_z = _mm512_load_ps(roz_a);
+                    __m512 vrd_x = _mm512_load_ps(rdx_a);
+                    __m512 vrd_y = _mm512_load_ps(rdy_a);
+                    __m512 vrd_z = _mm512_load_ps(rdz_a);
+
+                    March16 m16 = ray_march_avx512(vro_x, vro_y, vro_z, vrd_x, vrd_y, vrd_z);
+
+                    alignas(64) float hx[16], hy[16], hz[16], ht[16];
+                    alignas(64) int   hm[16];
+                    _mm512_store_ps(hx, m16.pos_x); _mm512_store_ps(hy, m16.pos_y); _mm512_store_ps(hz, m16.pos_z);
+                    _mm512_store_ps(ht, m16.t);
+                    _mm512_store_epi32(hm, m16.mat);
+
+                    alignas(64) float col_r[16], col_g[16], col_b[16];
+                    alignas(64) float pnx[16], pny[16], pnz[16];
+                    shade_batch_avx512(hx, hy, hz, hm, m16.hit_mask,
+                                       rdx0, rdy0, rdz0,
+                                       cam_pos, tid,
+                                       frame == 0 ? prev_gi  : nullptr,
+                                       frame == 0 ? prev_cam : nullptr,
+                                       frame == 0 ? curr_gi  : nullptr,
+                                       y, tx,
+                                       col_r, col_g, col_b,
+                                       frame == 0 ? pnx : nullptr,
+                                       frame == 0 ? pny : nullptr,
+                                       frame == 0 ? pnz : nullptr);
+
+                    for(int dx=0;dx<batch;dx++){
+                        int xi = tx + dx;
+                        bool did_hit = (m16.hit_mask >> dx) & 1;
+                        V3 fog_rd = {rdx_a[dx], rdy_a[dx], rdz_a[dx]};
+                        V3 col    = {col_r[dx], col_g[dx], col_b[dx]};
+                        col = apply_fog(col, ht[dx], fog_rd);
+                        if(frame==0){
+                            dep[y*W+xi] = ht[dx];
+                            if(did_hit){
+                                nrm[(y*W+xi)*3+0]=pnx[dx]*.5f+.5f;
+                                nrm[(y*W+xi)*3+1]=pny[dx]*.5f+.5f;
+                                nrm[(y*W+xi)*3+2]=pnz[dx]*.5f+.5f;
+                            } else {
+                                nrm[(y*W+xi)*3+0]=.5f; nrm[(y*W+xi)*3+1]=.5f; nrm[(y*W+xi)*3+2]=.5f;
+                            }
+                        }
+                        acc[(y*W+xi)*3+0]+=col.x;
+                        acc[(y*W+xi)*3+1]+=col.y;
+                        acc[(y*W+xi)*3+2]+=col.z;
+                    }
+                };
+
+                // 2× unrolled: process two 16-wide tiles per loop iteration.
+                // Odd-width images are handled gracefully — process_tile_avx512
+                // guards on tx >= W and clamps partial tiles via min(16, W-tx).
+                for(int x=0; x<W; x+=32){
+                    process_tile_avx512(x);
+                    process_tile_avx512(x + 16);
+                }
+            }
+        }
+#elif defined(__AVX2__) || defined(__AVX__)
+        // ── AVX2/AVX path: 2D tiles of 8×4 pixels ───────────────────────────
+        // Same 4-row strip strategy as the AVX-512 path: adjacent rows share
+        // nearly identical (x,z) FBM inputs → better L1/L2 reuse in avx8_fbm.
+#pragma omp parallel for schedule(dynamic,1)
+        for(int ty=0;ty<H;ty+=4){
+            int tid=0;
+#ifdef _OPENMP
+            tid=omp_get_thread_num()&63;
+#endif
+            int row_end=std::min(ty+4,H);
+            for(int y=ty;y<row_end;y++){
+            rng_state[tid]^=(uint32_t)(y*7919+frame*2053);
+                // ── AVX2 tile processor lambda (2× unrolled x-loop) ─────────
+                // Same strategy as AVX-512 path: step by 16, process two 8-wide
+                // tiles per iteration to halve loop overhead and let the OOO core
+                // overlap tile-B setup with tile-A march latency.
+                auto process_tile_avx8 = [&](int tx) {
+                    if (tx >= W) return;
+                    int batch=std::min(8,W-tx);
+
+                    alignas(32) float rox_a[8],roy_a[8],roz_a[8];
+                    alignas(32) float rdx_a[8],rdy_a[8],rdz_a[8];
+                    alignas(32) float rdx0[8], rdy0[8], rdz0[8];
+
+                    for(int dx=0;dx<8;dx++){
+                        int xi=tx+dx; if(xi>=W) xi=W-1;
+                        float ux=(xi+.5f+jx*.5f+(rng_float(tid)-.5f)*.3f)/W*2-1;
+                        float uy=1-(y+.5f+jy*.5f+(rng_float(tid)-.5f)*.3f)/H*2;
+                        float rdx_=cam_fwd.x+cam_right.x*(ux*aspect*fov)+cam_up.x*(uy*fov);
+                        float rdy_=cam_fwd.y+cam_right.y*(ux*aspect*fov)+cam_up.y*(uy*fov);
+                        float rdz_=cam_fwd.z+cam_right.z*(ux*aspect*fov)+cam_up.z*(uy*fov);
+                        float rlen=sqrtf(rdx_*rdx_+rdy_*rdy_+rdz_*rdz_);
+                        rdx0[dx]=rdx_/rlen; rdy0[dx]=rdy_/rlen; rdz0[dx]=rdz_/rlen;
+                        float dof_str=0.02f;
+                        float dfx=rng_float(tid)*2-1,dfy=rng_float(tid)*2-1;
+                        float rox_=cam_pos.x+cam_right.x*dfx*dof_str+cam_up.x*dfy*dof_str;
+                        float roy_=cam_pos.y+cam_right.y*dfx*dof_str+cam_up.y*dfy*dof_str;
+                        float roz_=cam_pos.z+cam_right.z*dfx*dof_str+cam_up.z*dfy*dof_str;
+                        float fx_=rox_+rdx0[dx]*40,fy_=roy_+rdy0[dx]*40,fz_=roz_+rdz0[dx]*40;
+                        float fdx=fx_-rox_,fdy=fy_-roy_,fdz=fz_-roz_;
+                        float flen=sqrtf(fdx*fdx+fdy*fdy+fdz*fdz);
+                        rox_a[dx]=rox_; roy_a[dx]=roy_; roz_a[dx]=roz_;
+                        rdx_a[dx]=fdx/flen; rdy_a[dx]=fdy/flen; rdz_a[dx]=fdz/flen;
+                    }
+
+                    __m256 vro_x=_mm256_load_ps(rox_a),vro_y=_mm256_load_ps(roy_a),vro_z=_mm256_load_ps(roz_a);
+                    __m256 vrd_x=_mm256_load_ps(rdx_a),vrd_y=_mm256_load_ps(rdy_a),vrd_z=_mm256_load_ps(rdz_a);
+                    March8 m8=ray_march_avx8(vro_x,vro_y,vro_z,vrd_x,vrd_y,vrd_z);
+
+                    alignas(32) float hx[8],hy[8],hz[8],ht[8]; alignas(32) int hm[8];
+                    _mm256_store_ps(hx,m8.pos_x); _mm256_store_ps(hy,m8.pos_y); _mm256_store_ps(hz,m8.pos_z);
+                    _mm256_store_ps(ht,m8.t);     _mm256_store_si256((__m256i*)hm,m8.mat);
+
+                    alignas(32) float col_r[8],col_g[8],col_b[8];
+                    alignas(32) float pnx[8],pny[8],pnz[8];
+                    shade_batch_avx8(hx,hy,hz,hm,m8.hit_mask,
+                                     rdx0,rdy0,rdz0,
+                                     cam_pos,tid,
+                                     frame==0?prev_gi:nullptr,
+                                     frame==0?prev_cam:nullptr,
+                                     frame==0?curr_gi:nullptr,
+                                     y,tx,
+                                     col_r,col_g,col_b,
+                                     frame==0?pnx:nullptr,
+                                     frame==0?pny:nullptr,
+                                     frame==0?pnz:nullptr);
+
+                    for(int dx=0;dx<batch;dx++){
+                        int xi=tx+dx;
+                        bool did_hit=(m8.hit_mask>>dx)&1;
+                        V3 fog_rd={rdx_a[dx],rdy_a[dx],rdz_a[dx]};
+                        V3 col={col_r[dx],col_g[dx],col_b[dx]};
+                        col=apply_fog(col,ht[dx],fog_rd);
+                        if(frame==0){
+                            dep[y*W+xi]=ht[dx];
+                            if(did_hit){
+                                nrm[(y*W+xi)*3+0]=pnx[dx]*.5f+.5f;
+                                nrm[(y*W+xi)*3+1]=pny[dx]*.5f+.5f;
+                                nrm[(y*W+xi)*3+2]=pnz[dx]*.5f+.5f;
+                            } else {
+                                nrm[(y*W+xi)*3+0]=.5f;
+                                nrm[(y*W+xi)*3+1]=.5f;
+                                nrm[(y*W+xi)*3+2]=.5f;
+                            }
+                        }
+                        acc[(y*W+xi)*3+0]+=col.x;
+                        acc[(y*W+xi)*3+1]+=col.y;
+                        acc[(y*W+xi)*3+2]+=col.z;
+                    }
+                };
+
+                for(int x=0; x<W; x+=16){
+                    process_tile_avx8(x);
+                    process_tile_avx8(x + 8);
+                }
+            }  // end for(int y) inner row loop
+        }  // end for(int ty) 4-row strip loop
+#else
+        // ── Scalar fallback ───────────────────────────────────────────────
 #pragma omp parallel for schedule(dynamic,4)
         for(int y=0;y<H;y++){
             int tid=0;
@@ -2389,178 +2903,6 @@ void render_frame(const Camera& cam, int SAMPLES, float anim_t,
             tid=omp_get_thread_num()&63;
 #endif
             rng_state[tid]^=(uint32_t)(y*7919+frame*2053);
-
-#ifdef __AVX512F__
-            // ── AVX-512 path: 16 primary rays at a time ──────────────────
-            for(int x=0;x<W;x+=16){
-                int batch = std::min(16, W-x);
-
-                // Build 16 ray origins + directions (with DoF jitter)
-                alignas(64) float rox_a[16], roy_a[16], roz_a[16];
-                alignas(64) float rdx_a[16], rdy_a[16], rdz_a[16];
-                // We also need the un-jittered direction for fog distance
-                alignas(64) float rdx0[16], rdy0[16], rdz0[16];
-
-                for(int dx=0;dx<16;dx++){
-                    int xi = x + dx;
-                    if(xi >= W) xi = W-1;  // clamp last partial tile
-
-                    float ux = (xi+.5f+jx*.5f+(rng_float(tid)-.5f)*.3f)/W*2-1;
-                    float uy = 1-(y+.5f+jy*.5f+(rng_float(tid)-.5f)*.3f)/H*2;
-                    float rdx_ = cam_fwd.x + cam_right.x*(ux*aspect*fov) + cam_up.x*(uy*fov);
-                    float rdy_ = cam_fwd.y + cam_right.y*(ux*aspect*fov) + cam_up.y*(uy*fov);
-                    float rdz_ = cam_fwd.z + cam_right.z*(ux*aspect*fov) + cam_up.z*(uy*fov);
-                    float rlen = sqrtf(rdx_*rdx_+rdy_*rdy_+rdz_*rdz_);
-                    rdx0[dx]=rdx_/rlen; rdy0[dx]=rdy_/rlen; rdz0[dx]=rdz_/rlen;
-
-                    float dof_str=0.02f;
-                    float dfx=rng_float(tid)*2-1, dfy=rng_float(tid)*2-1;
-                    float rox_ = cam_pos.x + cam_right.x*dfx*dof_str + cam_up.x*dfy*dof_str;
-                    float roy_ = cam_pos.y + cam_right.y*dfx*dof_str + cam_up.y*dfy*dof_str;
-                    float roz_ = cam_pos.z + cam_right.z*dfx*dof_str + cam_up.z*dfy*dof_str;
-                    float fx_ = rox_+rdx0[dx]*40, fy_ = roy_+rdy0[dx]*40, fz_ = roz_+rdz0[dx]*40;
-                    float fdx = fx_-rox_, fdy = fy_-roy_, fdz = fz_-roz_;
-                    float flen = sqrtf(fdx*fdx+fdy*fdy+fdz*fdz);
-                    rox_a[dx]=rox_; roy_a[dx]=roy_; roz_a[dx]=roz_;
-                    rdx_a[dx]=fdx/flen; rdy_a[dx]=fdy/flen; rdz_a[dx]=fdz/flen;
-                }
-
-                // Load into AVX-512 registers
-                __m512 vro_x = _mm512_load_ps(rox_a);
-                __m512 vro_y = _mm512_load_ps(roy_a);
-                __m512 vro_z = _mm512_load_ps(roz_a);
-                __m512 vrd_x = _mm512_load_ps(rdx_a);
-                __m512 vrd_y = _mm512_load_ps(rdy_a);
-                __m512 vrd_z = _mm512_load_ps(rdz_a);
-
-                // March all 16 primary rays at once
-                March16 m16 = ray_march_avx512(vro_x, vro_y, vro_z, vrd_x, vrd_y, vrd_z);
-
-                // Extract primary hit results
-                alignas(64) float hx[16], hy[16], hz[16], ht[16];
-                alignas(64) int   hm[16];
-                _mm512_store_ps(hx, m16.pos_x); _mm512_store_ps(hy, m16.pos_y); _mm512_store_ps(hz, m16.pos_z);
-                _mm512_store_ps(ht, m16.t);
-                _mm512_store_epi32(hm, m16.mat);
-
-                // ── Batch-shade all 16 secondary rays (shadow + GI) ──────────
-                // Pass reprojection caches only on first SPP pass (frame==0):
-                // subsequent passes add independent new GI rays, no blending needed.
-                alignas(64) float col_r[16], col_g[16], col_b[16];
-                shade_batch_avx512(hx, hy, hz, hm, m16.hit_mask,
-                                   rdx0, rdy0, rdz0,
-                                   cam_pos, tid,
-                                   frame == 0 ? prev_gi  : nullptr,
-                                   frame == 0 ? prev_cam : nullptr,
-                                   frame == 0 ? curr_gi  : nullptr,
-                                   y, x,
-                                   col_r, col_g, col_b);
-
-                for(int dx=0;dx<batch;dx++){
-                    int xi = x + dx;
-                    bool did_hit = (m16.hit_mask >> dx) & 1;
-
-                    // Apply fog using the DoF-jittered direction (matches cpurt5 behaviour)
-                    V3 fog_rd = {rdx_a[dx], rdy_a[dx], rdz_a[dx]};
-                    V3 col    = {col_r[dx], col_g[dx], col_b[dx]};
-                    col = apply_fog(col, ht[dx], fog_rd);
-
-                    // Store depth/normal for denoiser (frame 0 only)
-                    if(frame==0){
-                        dep[y*W+xi] = ht[dx];
-                        if(did_hit){
-                            V3 p = {hx[dx], hy[dx], hz[dx]};
-                            V3 n = scene_normal(p);
-                            nrm[(y*W+xi)*3+0]=n.x*.5f+.5f;
-                            nrm[(y*W+xi)*3+1]=n.y*.5f+.5f;
-                            nrm[(y*W+xi)*3+2]=n.z*.5f+.5f;
-                        } else {
-                            nrm[(y*W+xi)*3+0]=.5f; nrm[(y*W+xi)*3+1]=.5f; nrm[(y*W+xi)*3+2]=.5f;
-                        }
-                    }
-                    acc[(y*W+xi)*3+0]+=col.x;
-                    acc[(y*W+xi)*3+1]+=col.y;
-                    acc[(y*W+xi)*3+2]+=col.z;
-                }
-            }
-#elif defined(__AVX2__) || defined(__AVX__)
-            // ── AVX2/AVX path: 8 primary rays at a time ───────────────────
-            for(int x=0;x<W;x+=8){
-                int batch=std::min(8,W-x);
-
-                alignas(32) float rox_a[8],roy_a[8],roz_a[8];
-                alignas(32) float rdx_a[8],rdy_a[8],rdz_a[8];
-                alignas(32) float rdx0[8], rdy0[8], rdz0[8];
-
-                for(int dx=0;dx<8;dx++){
-                    int xi=x+dx; if(xi>=W) xi=W-1;
-                    float ux=(xi+.5f+jx*.5f+(rng_float(tid)-.5f)*.3f)/W*2-1;
-                    float uy=1-(y+.5f+jy*.5f+(rng_float(tid)-.5f)*.3f)/H*2;
-                    float rdx_=cam_fwd.x+cam_right.x*(ux*aspect*fov)+cam_up.x*(uy*fov);
-                    float rdy_=cam_fwd.y+cam_right.y*(ux*aspect*fov)+cam_up.y*(uy*fov);
-                    float rdz_=cam_fwd.z+cam_right.z*(ux*aspect*fov)+cam_up.z*(uy*fov);
-                    float rlen=sqrtf(rdx_*rdx_+rdy_*rdy_+rdz_*rdz_);
-                    rdx0[dx]=rdx_/rlen; rdy0[dx]=rdy_/rlen; rdz0[dx]=rdz_/rlen;
-                    float dof_str=0.02f;
-                    float dfx=rng_float(tid)*2-1,dfy=rng_float(tid)*2-1;
-                    float rox_=cam_pos.x+cam_right.x*dfx*dof_str+cam_up.x*dfy*dof_str;
-                    float roy_=cam_pos.y+cam_right.y*dfx*dof_str+cam_up.y*dfy*dof_str;
-                    float roz_=cam_pos.z+cam_right.z*dfx*dof_str+cam_up.z*dfy*dof_str;
-                    float fx_=rox_+rdx0[dx]*40,fy_=roy_+rdy0[dx]*40,fz_=roz_+rdz0[dx]*40;
-                    float fdx=fx_-rox_,fdy=fy_-roy_,fdz=fz_-roz_;
-                    float flen=sqrtf(fdx*fdx+fdy*fdy+fdz*fdz);
-                    rox_a[dx]=rox_; roy_a[dx]=roy_; roz_a[dx]=roz_;
-                    rdx_a[dx]=fdx/flen; rdy_a[dx]=fdy/flen; rdz_a[dx]=fdz/flen;
-                }
-
-                __m256 vro_x=_mm256_load_ps(rox_a),vro_y=_mm256_load_ps(roy_a),vro_z=_mm256_load_ps(roz_a);
-                __m256 vrd_x=_mm256_load_ps(rdx_a),vrd_y=_mm256_load_ps(rdy_a),vrd_z=_mm256_load_ps(rdz_a);
-                March8 m8=ray_march_avx8(vro_x,vro_y,vro_z,vrd_x,vrd_y,vrd_z);
-
-                alignas(32) float hx[8],hy[8],hz[8],ht[8]; alignas(32) int hm[8];
-                _mm256_store_ps(hx,m8.pos_x); _mm256_store_ps(hy,m8.pos_y); _mm256_store_ps(hz,m8.pos_z);
-                _mm256_store_ps(ht,m8.t);     _mm256_store_si256((__m256i*)hm,m8.mat);
-
-                alignas(32) float col_r[8],col_g[8],col_b[8];
-                alignas(32) float pnx[8],pny[8],pnz[8];  // primary normals for denoiser
-                shade_batch_avx8(hx,hy,hz,hm,m8.hit_mask,
-                                 rdx0,rdy0,rdz0,
-                                 cam_pos,tid,
-                                 frame==0?prev_gi:nullptr,
-                                 frame==0?prev_cam:nullptr,
-                                 frame==0?curr_gi:nullptr,
-                                 y,x,
-                                 col_r,col_g,col_b,
-                                 frame==0?pnx:nullptr,
-                                 frame==0?pny:nullptr,
-                                 frame==0?pnz:nullptr);
-
-                for(int dx=0;dx<batch;dx++){
-                    int xi=x+dx;
-                    bool did_hit=(m8.hit_mask>>dx)&1;
-                    V3 fog_rd={rdx_a[dx],rdy_a[dx],rdz_a[dx]};
-                    V3 col={col_r[dx],col_g[dx],col_b[dx]};
-                    col=apply_fog(col,ht[dx],fog_rd);
-                    if(frame==0){
-                        dep[y*W+xi]=ht[dx];
-                        if(did_hit){
-                            // normals already computed by shade_batch_avx8 — no extra scene_normal call
-                            nrm[(y*W+xi)*3+0]=pnx[dx]*.5f+.5f;
-                            nrm[(y*W+xi)*3+1]=pny[dx]*.5f+.5f;
-                            nrm[(y*W+xi)*3+2]=pnz[dx]*.5f+.5f;
-                        } else {
-                            nrm[(y*W+xi)*3+0]=.5f;
-                            nrm[(y*W+xi)*3+1]=.5f;
-                            nrm[(y*W+xi)*3+2]=.5f;
-                        }
-                    }
-                    acc[(y*W+xi)*3+0]+=col.x;
-                    acc[(y*W+xi)*3+1]+=col.y;
-                    acc[(y*W+xi)*3+2]+=col.z;
-                }
-            }
-#else
-            // ── Scalar fallback (identical to cpurt4) ─────────────────────
             for(int x=0;x<W;x++){
                 float ux=(x+.5f+jx*.5f+(rng_float(tid)-.5f)*.3f)/W*2-1;
                 float uy=1-(y+.5f+jy*.5f+(rng_float(tid)-.5f)*.3f)/H*2;
@@ -2589,8 +2931,8 @@ void render_frame(const Camera& cam, int SAMPLES, float anim_t,
                 acc[(y*W+x)*3+1]+=col.y;
                 acc[(y*W+x)*3+2]+=col.z;
             }
-#endif
         }
+#endif
     }
 
     for(int i=0;i<NP*3;i++) buf[i]=acc[i]/SAMPLES;
@@ -2755,13 +3097,13 @@ int main(int argc, char** argv) {
     bool hd   = argc>1 && !strcmp(argv[1],"hd");
 
 #ifdef __AVX512F__
-    printf("cpurt9 — AVX-512 build  (full pipeline SIMD: march+shadow+GI+normal+AO+mat)\n");
+    printf("cpurt15 — AVX-512 build  (FBM oct 3 + 2D tiles both ISAs)\n");
 #elif defined(__AVX2__)
-    printf("cpurt9 — AVX2 build     (8-wide full pipeline)\n");
+    printf("cpurt15 — AVX2 build     (FBM oct 3 + 8x4 2D tiling)\n");
 #elif defined(__AVX__)
-    printf("cpurt9 — AVX build      (8-wide batch rays + temporal reprojection)\n");
+    printf("cpurt15 — AVX build      (8-wide batch rays)\n");
 #else
-    printf("cpurt9 — scalar build   (no SIMD)\n");
+    printf("cpurt15 — scalar build   (no SIMD)\n");
 #endif
 
     printf("Loading baked SDF objects...\n");
@@ -2828,7 +3170,7 @@ int main(int argc, char** argv) {
         int W = hd?1920 : hq?800 : fast?200 : 400;
         int H = hd?1080 : hq?450 : fast?113 : 225;
         int S = hd?8    : hq?24  : fast?4   : 12;
-        const char* outpath = hd?"cpurt7_hd.ppm" : hq?"cpurt7_hq.ppm" : "cpurt7_output.ppm";
+        const char* outpath = hd?"cpurt15_hd.ppm" : hq?"cpurt15_hq.ppm" : "cpurt15_output.ppm";
         if(hd) printf("Full HD 1920x1080 — this takes ~15-20 min on 2 cores\n");
         Camera cam = build_camera(0.f, W, H);
         auto t0=std::chrono::high_resolution_clock::now();

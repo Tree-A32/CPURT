@@ -294,7 +294,7 @@ struct Menu {
 
     void init() {
         items.clear();
-        items.push_back({ "Renderer",     {"GPU (GLSL)", "CPU (cpurt10)"}, 0 });
+        items.push_back({ "Renderer",     {"GPU (GLSL)", "CPU (cpurt15)"}, 0 });
         items.push_back({"Resolution",    {"1280x720", "1920x1080", "2560x1440", "800x600"}, 0});
         items.push_back({"Render Scale",  {"1x (full)", "2x (half)", "4x (quarter)"}, 1});
         items.push_back({"Shadows",       {"On", "Off"}, 0});
