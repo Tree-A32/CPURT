@@ -5,69 +5,103 @@ raymarching. The goal has been to push real-world render throughput as far as po
 AVX-512 and AVX2 SIMD, OpenMP multithreading, and algorithmic improvements — targeting ~3×
 speedup over the cpurt8 baseline on both ISAs.
 
-The companion `game.cpp` is a real-time GPU/CPU SDF viewer using the same scene, built with
-SDL2 + OpenGL (GLSL shaders for GPU mode, calling `cpurt_render_buffer()` from cpurt15 for
-CPU mode).
+The companion `game.cpp` is a real-time GPU/CPU SDF viewer using the same scene. CPURT17
+builds it with SDL2 + GLEW / OpenGL 3.3 core: GLSL shaders for GPU mode, and
+`cpurt_render_buffer()` from `cpurt17.cpp` for CPU mode. `build.sh` supports both native
+Linux and MSYS2 MINGW64.
 
 ---
 
 ## Files
 
+Sources live under each version's `source code/` folder; prebuilt Windows binaries and DLLs
+stay in the version root.
+
 | File | Purpose |
 |------|---------|
-| `cpurt15.cpp` | Current renderer (latest, single self-contained .cpp) |
-| `game.cpp` | Real-time SDL2/OpenGL viewer — GPU GLSL or CPU path via `cpurt_render_buffer()` |
-| `baker.cpp` | Bakes an OBJ mesh into a `.sdf` voxel grid file (used to make `assets/*.sdf`) |
-| `build.sh` | Build script — auto-detects AVX-512 vs AVX2, also builds game |
-| `assets/arch.sdf` | Baked SDF grid: stone arch, loaded at world position (8, terrain_h(8,0), 0), scale 2.5 |
-| `assets/torus.sdf` | Baked SDF grid: gold torus, loaded at (0, 5, 0), scale 2.0, animated rotation |
-| `assets/sphere.sdf` | Baked SDF grid: crystal sphere, loaded at (-10, terrain_h(-10,15)+1.2, 15), scale 1.5 |
+| `Release/CPURT15/source code/cpurt15.cpp` | Released renderer (stable baseline) |
+| `Beta/CPURT16/source code/cpurt16.cpp` | Beta renderer: AVX2 water reflections, GI oct 2, ray coherence sorting |
+| `Beta/CPURT17/source code/cpurt17.cpp` | Current beta renderer; carries cpurt16's optimizations plus cheaper/temporally cached water reflections |
+| `Beta/CPURT17/source code/game.cpp` | Current realtime viewer — SDL2/GLEW OpenGL 3.3 core, GPU GLSL or CPU path via `cpurt_render_buffer()` |
+| `Beta/CPURT17/source code/build.sh` | Current build script — native Linux or MSYS2 MINGW64, auto-detects AVX-512 vs AVX2 |
+| `Beta/CPURT17/source code/baker.cpp` | Bakes an OBJ mesh into a `.sdf` voxel grid file (used to make `assets/*.sdf`) |
+| `Beta/CPURT17/assets/*.sdf` | Baked SDF grids: arch (8, terrain_h(8,0), 0) scale 2.5; torus (0, 5, 0) scale 2.0 with animated rotation; sphere (-10, terrain_h(-10,15)+1.2, 15) scale 1.5 |
+| `Beta/CPURT17/game_win32.cpp` | Legacy standalone Win32/WGL viewer, kept for reference; not used by `build.sh` |
 
-The `.sdf` files must be present at runtime. If missing, those objects are silently skipped.
+The `.sdf` files must be present in the working directory at runtime (for CPU mode). If
+missing, those objects are silently skipped. Run the built binaries from `Beta/CPURT17`, or
+copy them there from `source code/`.
 
 ---
 
 ## Building
 
+Current beta (from the repository root):
+
 ```bash
-bash build.sh
+cd "Beta/CPURT17/source code"
+./build.sh
 ```
 
-The script auto-detects AVX-512 (`/proc/cpuinfo`). Manual builds:
+This produces `cpurt17`, `game`, and `baker` on Linux, or the corresponding `.exe` files
+under MSYS2 MINGW64. On Windows, keep `SDL2.dll` and `glew32.dll` next to `game.exe`;
+`build.sh` adds `-lopengl32` automatically and statically links the OpenMP/runtime libs.
+
+Dependencies:
 
 ```bash
-# AVX-512 (fastest):
-g++ -O3 -mavx512f -mavx512dq -mavx512bw -mavx512vl -fopenmp -std=c++17 -o cpurt15 cpurt15.cpp -lm
+# Debian/Ubuntu
+sudo apt install build-essential pkg-config libsdl2-dev libglew-dev
 
-# AVX2 fallback:
-g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -o cpurt15 cpurt15.cpp -lm
+# MSYS2 MINGW64
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf \
+         mingw-w64-x86_64-SDL2 mingw-w64-x86_64-glew
+```
 
-# Game (links cpurt15 for CPU mode):
-# Linux:
-g++ -O3 -march=native -fopenmp -std=c++17 -DNO_MAIN \
-    -o game game.cpp cpurt15.cpp $(sdl2-config --cflags --libs) -lGL -lGLEW -lm
-# Windows (place SDL2.dll + glew32.dll next to game.exe):
-g++ -O3 -march=native -fopenmp -std=c++17 -DNO_MAIN \
+The script auto-detects AVX-512 (`/proc/cpuinfo`); override with `AVX512=0` (AVX2) or
+`AVX512=1` (AVX-512). Manual equivalents:
+
+```bash
+# Current CPU renderer — AVX-512:
+g++ -O3 -mavx512f -mavx512dq -mavx512bw -mavx512vl -fopenmp -std=c++17 \
+    -o cpurt17 cpurt17.cpp -lm
+
+# Current CPU renderer — AVX2:
+g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -o cpurt17 cpurt17.cpp -lm
+
+# Game, Linux:
+g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -D__AVX2__ -DNO_MAIN \
+    -o game game.cpp cpurt17.cpp \
+    $(pkg-config --cflags --libs sdl2 glew) -lm
+
+# Game, MSYS2 MINGW64:
+g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -D__AVX2__ -DNO_MAIN \
     -static-libgcc -static-libstdc++ \
-    -o game game.cpp cpurt15.cpp $(sdl2-config --cflags --libs) -lopengl32 -lglew32 -lm
+    -o game.exe game.cpp cpurt17.cpp \
+    $(pkg-config --cflags --libs sdl2 glew) -lopengl32 -lm
 ```
 
-`-DNO_MAIN` suppresses cpurt15's own `main()` so game.cpp can provide its own.
+`-DNO_MAIN` suppresses `cpurt17.cpp`'s own `main()` so `game.cpp` can provide its own.
+For older versions, use the same commands with the version's own source filenames.
 
 ---
 
 ## Running the renderer
 
+Run from the version root so `assets/*.sdf` is found:
+
 ```bash
-./cpurt15 fast        # 200×113, 4 samples  — quick preview
-./cpurt15             # 400×225, 12 samples — default still
-./cpurt15 hq          # 800×450, 24 samples — high quality
-./cpurt15 hd          # 1920×1080, 8 samples — full HD
-./cpurt15 video N     # all N frames (animated sequence, with temporal reprojection)
-./cpurt15 video F N   # single frame F out of N (silent warm-up frame before it)
+cd "Beta/CPURT17"
+"./source code/cpurt17" fast        # 200×113, 4 samples  — quick preview
+"./source code/cpurt17"             # 400×225, 12 samples — default still
+"./source code/cpurt17" hq          # 800×450, 24 samples — high quality
+"./source code/cpurt17" hd          # 1920×1080, 8 samples — full HD
+"./source code/cpurt17" video N     # all N frames (animated sequence, with temporal reprojection)
+"./source code/cpurt17" video F N   # single frame F out of N (silent warm-up frame before it)
 ```
 
-Output is a `.ppm` file. Convert to PNG/MP4 with ImageMagick or ffmpeg:
+CPURT17 still writes `cpurt15_output.ppm` by default (legacy filename). Convert to PNG/MP4
+with ImageMagick or ffmpeg:
 
 ```bash
 # Still → PNG
@@ -75,7 +109,7 @@ convert cpurt15_output.ppm output.png
 
 # Video sequence → MP4
 mkdir -p frames
-for i in $(seq 0 47); do ./cpurt15 video $i 48; done
+for i in $(seq 0 47); do "./source code/cpurt17" video $i 48; done
 ffmpeg -framerate 24 -i frames/frame_%04d.ppm \
   -vf scale=1280:720:flags=lanczos -c:v libx264 -crf 18 -pix_fmt yuv420p out.mp4
 ```
@@ -116,11 +150,16 @@ gather to hide the ~100-cycle gather latency.
 diffuse · shadow · AO + ambient + one-bounce GI + specular (metals/crystal). Atmospheric sky
 (Rayleigh + Mie scattering), exponential fog.
 
-**Key constants:**
+**Key constants (CPU offline renderer):**
 - `MAX_STEPS = 192` — primary ray march iteration cap
 - `SHADOW_STEPS = 64` — shadow ray iteration cap
 - `SURF_DIST = 0.004` — hit threshold
 - `MAX_DIST = 300.0` — miss threshold
+
+The realtime GPU shader in `game.cpp` uses tighter constants: `MAX_STEPS = 128`,
+`MAX_DIST = 150.0`, 48-step soft shadows with a minimum step clamp, and 4-step AO. The scene
+is otherwise the same, so the GPU image remains close to the CPU renderer while running much
+faster.
 
 ---
 
@@ -130,7 +169,7 @@ Each frame is processed in 32×4-pixel unrolled tiles (AVX-512, two 16-wide call
 
 ```
 render_frame()
-  └─ for each 4-row strip (AVX-512) / scanline (AVX2):
+  └─ for each 4-row strip (AVX-512 and AVX2):
        for each 16- (or 8-) pixel column tile:
          ray_march_avx512()          primary march, terrain_oct=7
            └─ eval_scene_avx512()    SDF evaluation (terrain + water + trees + grids)
@@ -275,7 +314,7 @@ Key wins:
   redundantly firing inside `shade_known_hit`. The reflection ray march inside the water path
   remains scalar per-pixel (unavoidable — it's a data-dependent secondary ray).
 
-### cpurt15 — AVX2 2× tile unroll + AO oct 2 + batched water reflections (current)
+### cpurt15 — AVX2 2× tile unroll + AO oct 2 + batched water reflections
 - **AVX2 2× unrolled x-loop** — mirrors the AVX-512 change from cpurt14. x-loop steps by
   16 and processes two 8-wide tiles per iteration via a captured lambda. Same loop-overhead
   and OOO overlap benefit on AVX2 hardware.
@@ -289,6 +328,30 @@ Key wins:
   scalar `ray_march` calls per tile with one 16-wide vectorised march. The Fresnel blend,
   water colour, caustic shimmer, and specular remain scalar per-lane (arithmetic only, not
   marches). AVX-512 only — the AVX2 water path still uses the scalar route.
+
+### cpurt16 — AVX2 water reflections + GI oct 2 + ray coherence sorting
+- **AVX2 batched water reflections** — `shade_water_batch_avx8()` mirrors the AVX-512 path.
+  Water lanes in a tile are collected into one 8-wide reflection march instead of up to eight
+  scalar `ray_march()` calls. Reflected-hit normals and soft shadows are also vectorised.
+- **GI oct 3→2** — GI bounce marches now evaluate terrain at oct=2. A single diffuse bounce
+  only needs large-scale shape, so this saves another ~33% of GI terrain cost. Both ISAs.
+- **Primary-ray coherence sorting** — each tile takes three short, low-quality march steps to
+  estimate hit depth, then sorts its 16/8 rays by that estimate before the main march. Rays
+  likely to hit soon are grouped together, reducing active-mask divergence. Applied from
+  frame > 0 so the frame-0 GI cache stays pixel-exact.
+
+### cpurt17 — cheaper/cached reflections + native Linux realtime viewer
+- **Cheaper reflection marches** — reflection `t_max` is reduced to 80, reflected-hit normals
+  and reflection terrain use oct=3, and reflected shadows use 32 steps instead of 64.
+- **Half-resolution reflections** — only even-indexed water lanes are marched; odd lanes
+  reuse their neighbour's result.
+- **Grazing-angle early-out** — reflected rays nearly parallel to the water go straight to
+  sky colour without a march.
+- **Temporal reflection cache** — `GICache` now stores RGB reflections. New samples blend
+  30% fresh / 70% cached, matching the existing temporal GI approach.
+- **Realtime viewer port** — the active `game.cpp` uses SDL2 + GLEW OpenGL 3.3 core and
+  builds natively on Linux (and under MSYS2 MINGW64). CPURT16/17 shader and scene fixes are
+  preserved. `game_win32.cpp` remains only as a legacy Win32/WGL reference.
 
 ---
 
@@ -311,28 +374,24 @@ The game calls this when CPU render mode is selected. The function renders into 
 one byte per channel, sRGB gamma-corrected. It calls `render_frame()` with `SAMPLES=1`
 (single sample per pixel — fast enough for real-time at reduced resolution).
 
-Build the game with `-DNO_MAIN` to suppress cpurt12's own `main()`.
+Build the game with `-DNO_MAIN` to suppress `cpurt17.cpp`'s own `main()`.
 
 ---
 
-## What to optimize next
+## Optimization roadmap status
 
-The remaining highest-value targets, roughly in priority order:
+The three items that used to be listed as "what to optimize next" have now landed:
 
-1. **Batched water reflections for AVX2** — `shade_water_batch_avx512` exists for the
-   AVX-512 path; a matching `shade_water_batch_avx8` using `ray_march_avx8` and
-   `scene_normal_avx8` would give the same benefit on AVX2 hardware.
+1. **Batched water reflections for AVX2** — implemented as `shade_water_batch_avx8()` in
+   CPURT16 and carried into CPURT17.
+2. **GI oct 3→2** — implemented in CPURT16 for both AVX-512 and AVX2 GI marches.
+3. **Primary ray coherence sorting** — implemented in CPURT16 using a short pre-march and
+   per-tile lane sorting from frame 1 onward.
 
-2. **GI oct 3→2** — the GI bounce march uses oct=3 for terrain evaluation. Like AO, a
-   single diffuse bounce only needs large-scale scene shape. Dropping to oct=2 would save
-   another 33% of GI terrain cost. Visual quality test needed (GI hits slightly farther
-   geometry than AO samples, so the trade-off may differ).
-
-3. **Primary ray coherence sorting** — within a 2D tile, rays that hit roughly the same
-   scene region will follow similar march paths. Sorting the 16 (or 8) rays in a tile by
-   their first SDF hit distance before the main march loop could reduce divergence in
-   `active` mask transitions, letting lanes retire together and shortening the effective
-   step count. Low implementation complexity; benefit depends heavily on scene.
+Possible follow-ups:
+- Make the CPURT17 reflection cache camera-aware instead of pixel-index-only.
+- Expose GPU-side quality knobs so the realtime shader can mirror the CPU renderer's
+  reflection shortcuts when needed.
 
 ---
 
@@ -343,7 +402,7 @@ torus (grid 1) rotates at `rot_y = anim_t * 0.9` and bobs vertically; the crysta
 (grid 2) bobs at a different frequency. The water ripple is driven by `anim_t` in both the
 CPU SDF and the GLSL shader.
 
-The warm-up frame (`./cpurt15 video 0 N`) initializes the GI cache so frame 0
+The warm-up frame (`"./source code/cpurt17" video 0 N`) initializes the GI cache so frame 0
 doesn't have an empty reprojection buffer.
 
 ---
