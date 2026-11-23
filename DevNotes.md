@@ -20,7 +20,7 @@ stay in the version root.
 | File | Purpose |
 |------|---------|
 | `Release/CPURT15/source code/cpurt15.cpp` | Released renderer (stable baseline) |
-| `Release/CPURT20/source code/cpurt20.cpp` | Current release: AVX2 CPU renderer with final-pixel temporal reuse for 1280×720 @ 1/2 scale |
+| `Release/CPURT20/source code/cpurt20.cpp` | Current release: optimised AVX2 CPU renderer for 1280×720 @ 1/2 scale; realtime path has no temporal reuse |
 | `Release/CPURT20/source code/game.cpp` | Current realtime viewer; defaults to 1280×720, 1/2 render scale, 8 CPU threads |
 | `Release/CPURT20/source code/build.sh` | Current build script — native Linux or MSYS2 MINGW64, fixed AVX2/FMA mode |
 | `Release/CPURT20/source code/bench20.cpp` | Headless `cpurt_render_buffer()` benchmark (`bench20 W H FRAMES [move]`) |
@@ -97,7 +97,7 @@ cd "Release/CPURT20"
 "./source code/cpurt20"             # 400×225, 12 samples — default still
 "./source code/cpurt20" hq          # 800×450, 24 samples — high quality
 "./source code/cpurt20" hd          # 1920×1080, 8 samples — full HD
-"./source code/cpurt20" video N     # all N frames (animated sequence, with temporal reprojection)
+"./source code/cpurt20" video N     # all N frames (standalone GI reprojection only)
 "./source code/cpurt20" video F N   # single frame F out of N (silent warm-up frame before it)
 ```
 
@@ -120,48 +120,41 @@ ffmpeg -framerate 24 -i frames/frame_%04d.ppm \
 ## CPURT20 realtime CPU path
 
 CPURT20 keeps CPURT17's scene, march limits and shading unchanged. The realtime bridge
-(`cpurt_render_buffer()`) uses forward temporal reprojection: each previous visible pixel
-reconstructs its world-space hit point from previous depth and is projected through the current
-camera. A per-pixel atomic claim keeps the nearest candidate. Pixels with no valid candidate
-(disocclusions, animated materials, large view changes) are freshly shaded; valid pixels skip
-the primary march and all shadow/AO/GI/reflection work. Temporally reused lanes are compacted
-before the 8-wide march so they do not occupy SIMD slots. When the camera is unchanged, history
-maps 1:1 and the projection pass is skipped entirely.
+(`cpurt_render_buffer()`) has **no temporal reuse**: every pixel is freshly marched and shaded
+each frame, including GI, shadows, AO and reflections. The speedup over CPURT17 comes from the
+distance/material split, cached SDF/tree constants, active masks, compacted reusable lanes, and
+sky-cache writes — not from history. This removes the trailing smearing/ghosting seen with the
+earlier forward-reprojection experiment.
 
-This replaced the original gather-style cache lookup, which guessed the current hit from stale
-same-pixel depth. That could accept a previous final colour across a moving silhouette and was
-the source of the reported trailing smearing. Motion guards remain: reprojected pixels may not
-move more than 8 screen pixels, view directions must stay within a small angular delta, and
-high-contrast 3×3 final-colour neighbourhoods are recomputed. Water and animated SDF meshes are
-never reused.
+A previous revision forward-projected previous final-pixel colours using world-space hit points
+and an atomic nearest-candidate claim. It was disabled because even with motion guards it could
+drag stale colours across silhouettes during fast camera motion. GI/shadow/AO history reuse was
+also tested and rejected because it moved stochastic highlights.
 
-Measured on Ryzen 7 5700X (8 threads, AVX2) at 640×360 internal (1280×720 @ 1/2 scale):
+Measured on the development machine with the same AVX2 harness for all versions:
 
-| Workload | CPURT17 | CPURT20 (8 threads) | CPURT20 (12 threads) |
-|----------|---------|---------------------|----------------------|
-| Moving camera | 151.3 ms (6.6 fps) | 13.80 ms (72.5 fps) | 11.10 ms (90.1 fps) |
-| Static camera | 73.5 ms (13.6 fps) | 18.27 ms (54.7 fps) | 13.99 ms (71.5 fps) |
+| Workload | CPURT15 | CPURT17 | CPURT20 (8 threads) | CPURT20 (12 threads) | vs 17 (8 threads) | vs 15 (8 threads) |
+|---|---:|---:|---:|---:|---:|---:|
+| Still, 400×225, 12 samples | 1.51 s | 1.35 s | 0.36 s | — | 3.79× | 4.24× |
+| Realtime moving, 640×360 | 278.6 ms | 263.9 ms | 46.7 ms | 38.7 ms | 5.65× | 5.97× |
+| Realtime static, 640×360 | 302.6 ms | 111.2 ms | 49.5 ms | 40.6 ms | 2.25× | 6.12× |
 
-Quality was compared against CPURT17 frames at 640×360. With reuse disabled the MAE is 2.34
-(moving) and 6.46 (static); after a 3×3 blur those drop to ~0.85 and ~2.3, confirming the base
-difference is stochastic shadow/GI noise rather than scene structure. Against a CPURT20 no-reuse
-frame, the final forward-reuse path has MAE 4.29 (normal motion) and 2.66 (fast 0.03 rad/frame
-pan); channels differing by more than 8 are 12.67% and 6.87% respectively. Residual difference
-is stochastic shadow/GI noise from one-frame history, not geometry dragging. Very fast turns
-intentionally reject most reuse, so frame rate drops during those moments; normal motion stays
-above target. GI/shadow/AO history reuse was tested but disabled because it moved stochastic
-highlights too much; final-pixel reuse alone preserves the image much better.
+Equivalent time reductions at 8 threads: still −73.6% vs 17 / −76.4% vs 15; moving −82.3% /
+−83.2%; static −55.5% / −83.7%. Direct realtime-frame comparison against CPURT17 gives MAE
+0.01/255 (RMSE 0.41), i.e. visually identical output.
 
-### Debug switches
+The shipped `bench20.exe` prints `reuse=0/... sky=0`, confirming that no final-pixel history is
+active.
 
-`bench20` prints temporal-reuse counts. Environment variables (for experiments only):
+### Legacy debug switches
 
-- `CPURT_NO_REUSE=1` — disable final-pixel reuse.
-- `CPURT_NO_GI_REUSE=1` — disable GI/shadow/AO history (already off by default in the bridge).
-- `CPURT_REUSE_COLOR_TOL` — 3×3 final-colour spread in 8-bit units (default 16).
-- `CPURT_REUSE_VIEW_TOL` — maximum view-direction change (default 0.004).
-- `CPURT_REUSE_MAX_MOVE` / `CPURT_REUSE_SKY_MAX_MOVE` — maximum reprojection distance in pixels
-  for surfaces / sky (default 8 each).
+The historical reuse switches are still parsed in `cpurt20.cpp` but are inert in the current
+AVX2 realtime path:
+
+- `CPURT_NO_REUSE=1` — no effect; final-pixel reuse is already disabled.
+- `CPURT_NO_GI_REUSE=1` — no effect; GI history is already passed as `nullptr`.
+- `CPURT_REUSE_COLOR_TOL`, `CPURT_REUSE_VIEW_TOL`, `CPURT_REUSE_MAX_MOVE`,
+  `CPURT_REUSE_SKY_MAX_MOVE` — unused unless the disabled reprojection code is re-enabled.
 - `CPURT_BAKED=1` / `CPURT_BOUNDS=1` — enable optional baked-height / height-bound experiments.
   Both are disabled by default because they measurably change terrain edges.
 
@@ -237,16 +230,15 @@ render_frame()
 
 The cache (`struct GICache`) stores per-pixel GI, shadow, AO, normals, reflection colour,
 final gamma-encoded colour, depth and material. The standalone renderer still reprojects GI
-(75% cached, 25% new ray). CPURT20's realtime bridge uses the same buffers for final-pixel
-reprojection instead; GI history is deliberately not reused there because it visibly moved
-stochastic highlights.
+(75% cached, 25% new ray). CPURT20's realtime bridge deliberately uses no history at all:
+final colour, GI, shadows, AO and reflections are recomputed every frame.
 
 ---
 
 ## SIMD architecture
 
 The file contains three independent implementations that compile together and are selected
-at runtime by `#ifdef __AVX512F__` / `#ifdef __AVX2__`:
+at compile time by `#ifdef __AVX512F__` / `#ifdef __AVX2__`:
 
 ### AVX-512 path (16-wide)
 - **`eval_scene_avx512(px, py, pz, terrain_oct=7)`** — evaluates the full scene SDF for 16
@@ -405,6 +397,17 @@ Key wins:
   builds natively on Linux (and under MSYS2 MINGW64). CPURT16/17 shader and scene fixes are
   preserved. `game_win32.cpp` remains only as a legacy Win32/WGL reference.
 
+### cpurt20 — optimised AVX2 realtime bridge, no temporal reuse
+- **Distance/material split** — primary marches separate far/near work and material classes so
+  inactive lanes are removed before shading.
+- **Cached constants and active masks** — SDF/tree constants are hoisted and SIMD lanes are
+  compacted, reducing divergence and redundant setup.
+- **Sky-cache writes** — stable sky lanes are written without re-shading.
+- **Temporal reuse removed** — the earlier forward-reprojection final-pixel cache caused
+  trailing ghosting during camera motion; the realtime bridge now renders every pixel fresh.
+- **Build standardisation** — CPURT20 always builds AVX2/FMA; AVX-512 auto-selection was
+  removed to keep one tested path.
+
 ---
 
 ## `cpurt_render_buffer()` — game integration interface
@@ -426,7 +429,7 @@ The game calls this when CPU render mode is selected. The function renders into 
 one byte per channel, sRGB gamma-corrected. It calls `render_frame()` with `SAMPLES=1`
 (single sample per pixel — fast enough for real-time at reduced resolution).
 
-Build the game with `-DNO_MAIN` to suppress `cpurt17.cpp`'s own `main()`.
+Build the game with `-DNO_MAIN` to suppress `cpurt20.cpp`'s own `main()`.
 
 ---
 
@@ -441,7 +444,8 @@ The three items that used to be listed as "what to optimize next" have now lande
    per-tile lane sorting from frame 1 onward.
 
 Possible follow-ups:
-- Make the CPURT17 reflection cache camera-aware instead of pixel-index-only.
+- Revisit a camera-aware reflection cache for the realtime path; CPURT20 currently disables
+  reflection history to guarantee clean camera motion.
 - Expose GPU-side quality knobs so the realtime shader can mirror the CPU renderer's
   reflection shortcuts when needed.
 
@@ -454,7 +458,7 @@ torus (grid 1) rotates at `rot_y = anim_t * 0.9` and bobs vertically; the crysta
 (grid 2) bobs at a different frequency. The water ripple is driven by `anim_t` in both the
 CPU SDF and the GLSL shader.
 
-The warm-up frame (`"./source code/cpurt17" video 0 N`) initializes the GI cache so frame 0
+The warm-up frame (`"./source code/cpurt20" video 0 N`) initializes the GI cache so frame 0
 doesn't have an empty reprojection buffer.
 
 ---
