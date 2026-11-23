@@ -8,7 +8,7 @@ Windows: build with MSYS2 MINGW64 (SDL2 + GLEW). Keep SDL2.dll and glew32.dll ne
 
 Linux: build natively with g++, SDL2 and GLEW.
 
-    cd "Beta/CPURT17/source code"
+    cd "Release/CPURT20/source code"
     ./build.sh
 
 Then run from the version folder so assets/*.sdf is found:
@@ -17,7 +17,7 @@ Then run from the version folder so assets/*.sdf is found:
     "./source code/game"          # Linux
     "./source code/game.exe"      # MSYS2 MINGW64
 
-The script also builds ./cpurt17 and ./baker. Dependencies on Debian/Ubuntu:
+The script also builds ./cpurt20, ./bench20 and ./baker. Dependencies on Debian/Ubuntu:
     sudo apt install build-essential pkg-config libsdl2-dev libglew-dev
 
 
@@ -28,5 +28,5 @@ Best regards,
 A-32
 
 
-LATEST RELEASE VERSION: CPURT15
+LATEST RELEASE VERSION: CPURT20
 LATEST BETA VERSION: CPURT17

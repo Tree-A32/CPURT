@@ -5,10 +5,10 @@ raymarching. The goal has been to push real-world render throughput as far as po
 AVX-512 and AVX2 SIMD, OpenMP multithreading, and algorithmic improvements — targeting ~3×
 speedup over the cpurt8 baseline on both ISAs.
 
-The companion `game.cpp` is a real-time GPU/CPU SDF viewer using the same scene. CPURT17
+The companion `game.cpp` is a real-time GPU/CPU SDF viewer using the same scene. CPURT20
 builds it with SDL2 + GLEW / OpenGL 3.3 core: GLSL shaders for GPU mode, and
-`cpurt_render_buffer()` from `cpurt17.cpp` for CPU mode. `build.sh` supports both native
-Linux and MSYS2 MINGW64.
+`cpurt_render_buffer()` from `cpurt20.cpp` for CPU mode. `build.sh` supports both native
+Linux and MSYS2 MINGW64 and standardises on the AVX2/FMA path.
 
 ---
 
@@ -20,31 +20,35 @@ stay in the version root.
 | File | Purpose |
 |------|---------|
 | `Release/CPURT15/source code/cpurt15.cpp` | Released renderer (stable baseline) |
+| `Release/CPURT20/source code/cpurt20.cpp` | Current release: AVX2 CPU renderer with final-pixel temporal reuse for 1280×720 @ 1/2 scale |
+| `Release/CPURT20/source code/game.cpp` | Current realtime viewer; defaults to 1280×720, 1/2 render scale, 8 CPU threads |
+| `Release/CPURT20/source code/build.sh` | Current build script — native Linux or MSYS2 MINGW64, fixed AVX2/FMA mode |
+| `Release/CPURT20/source code/bench20.cpp` | Headless `cpurt_render_buffer()` benchmark (`bench20 W H FRAMES [move]`) |
 | `Beta/CPURT16/source code/cpurt16.cpp` | Beta renderer: AVX2 water reflections, GI oct 2, ray coherence sorting |
-| `Beta/CPURT17/source code/cpurt17.cpp` | Current beta renderer; carries cpurt16's optimizations plus cheaper/temporally cached water reflections |
-| `Beta/CPURT17/source code/game.cpp` | Current realtime viewer — SDL2/GLEW OpenGL 3.3 core, GPU GLSL or CPU path via `cpurt_render_buffer()` |
-| `Beta/CPURT17/source code/build.sh` | Current build script — native Linux or MSYS2 MINGW64, auto-detects AVX-512 vs AVX2 |
+| `Beta/CPURT17/source code/cpurt17.cpp` | Previous beta renderer; carries cpurt16's optimizations plus cheaper/temporally cached water reflections |
+| `Beta/CPURT17/source code/game.cpp` | Previous beta realtime viewer — SDL2/GLEW OpenGL 3.3 core, GPU GLSL or CPU path via `cpurt_render_buffer()` |
+| `Beta/CPURT17/source code/build.sh` | Previous beta build script — native Linux or MSYS2 MINGW64, auto-detects AVX-512 vs AVX2 |
 | `Beta/CPURT17/source code/baker.cpp` | Bakes an OBJ mesh into a `.sdf` voxel grid file (used to make `assets/*.sdf`) |
 | `Beta/CPURT17/assets/*.sdf` | Baked SDF grids: arch (8, terrain_h(8,0), 0) scale 2.5; torus (0, 5, 0) scale 2.0 with animated rotation; sphere (-10, terrain_h(-10,15)+1.2, 15) scale 1.5 |
-| `Beta/CPURT17/game_win32.cpp` | Legacy standalone Win32/WGL viewer, kept for reference; not used by `build.sh` |
+| `Beta/CPURT17/source code/game_win32.cpp` | Legacy standalone Win32/WGL viewer, kept for reference; not used by `build.sh` |
 
 The `.sdf` files must be present in the working directory at runtime (for CPU mode). If
-missing, those objects are silently skipped. Run the built binaries from `Beta/CPURT17`, or
-copy them there from `source code/`.
+missing, those objects are silently skipped. Run the built binaries from `Release/CPURT20`,
+or copy them there from `source code/`.
 
 ---
 
 ## Building
 
-Current beta (from the repository root):
+Current release (from the repository root):
 
 ```bash
-cd "Beta/CPURT17/source code"
+cd "Release/CPURT20/source code"
 ./build.sh
 ```
 
-This produces `cpurt17`, `game`, and `baker` on Linux, or the corresponding `.exe` files
-under MSYS2 MINGW64. On Windows, keep `SDL2.dll` and `glew32.dll` next to `game.exe`;
+This produces `cpurt20`, `game`, `bench20`, and `baker` on Linux, or the corresponding `.exe`
+files under MSYS2 MINGW64. On Windows, keep `SDL2.dll` and `glew32.dll` next to `game.exe`;
 `build.sh` adds `-lopengl32` automatically and statically links the OpenMP/runtime libs.
 
 Dependencies:
@@ -58,30 +62,27 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf \
          mingw-w64-x86_64-SDL2 mingw-w64-x86_64-glew
 ```
 
-The script auto-detects AVX-512 (`/proc/cpuinfo`); override with `AVX512=0` (AVX2) or
-`AVX512=1` (AVX-512). Manual equivalents:
+CPURT20 always builds the AVX2/FMA path; every AVX-512 CPU also supports AVX2, and the
+8-wide batched path carries all current optimisations. Manual equivalents:
 
 ```bash
-# Current CPU renderer — AVX-512:
-g++ -O3 -mavx512f -mavx512dq -mavx512bw -mavx512vl -fopenmp -std=c++17 \
-    -o cpurt17 cpurt17.cpp -lm
-
-# Current CPU renderer — AVX2:
-g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -o cpurt17 cpurt17.cpp -lm
+# CPURT20 CPU renderer — AVX2 (same as build.sh):
+g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -D__AVX2__ \
+    -o cpurt20 cpurt20.cpp -lm
 
 # Game, Linux:
 g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -D__AVX2__ -DNO_MAIN \
-    -o game game.cpp cpurt17.cpp \
+    -o game game.cpp cpurt20.cpp \
     $(pkg-config --cflags --libs sdl2 glew) -lm
 
 # Game, MSYS2 MINGW64:
 g++ -O3 -mavx2 -mfma -fopenmp -std=c++17 -D__AVX2__ -DNO_MAIN \
     -static-libgcc -static-libstdc++ \
-    -o game.exe game.cpp cpurt17.cpp \
+    -o game.exe game.cpp cpurt20.cpp \
     $(pkg-config --cflags --libs sdl2 glew) -lopengl32 -lm
 ```
 
-`-DNO_MAIN` suppresses `cpurt17.cpp`'s own `main()` so `game.cpp` can provide its own.
+`-DNO_MAIN` suppresses `cpurt20.cpp`'s own `main()` so `game.cpp` can provide its own.
 For older versions, use the same commands with the version's own source filenames.
 
 ---
@@ -91,16 +92,16 @@ For older versions, use the same commands with the version's own source filename
 Run from the version root so `assets/*.sdf` is found:
 
 ```bash
-cd "Beta/CPURT17"
-"./source code/cpurt17" fast        # 200×113, 4 samples  — quick preview
-"./source code/cpurt17"             # 400×225, 12 samples — default still
-"./source code/cpurt17" hq          # 800×450, 24 samples — high quality
-"./source code/cpurt17" hd          # 1920×1080, 8 samples — full HD
-"./source code/cpurt17" video N     # all N frames (animated sequence, with temporal reprojection)
-"./source code/cpurt17" video F N   # single frame F out of N (silent warm-up frame before it)
+cd "Release/CPURT20"
+"./source code/cpurt20" fast        # 200×113, 4 samples  — quick preview
+"./source code/cpurt20"             # 400×225, 12 samples — default still
+"./source code/cpurt20" hq          # 800×450, 24 samples — high quality
+"./source code/cpurt20" hd          # 1920×1080, 8 samples — full HD
+"./source code/cpurt20" video N     # all N frames (animated sequence, with temporal reprojection)
+"./source code/cpurt20" video F N   # single frame F out of N (silent warm-up frame before it)
 ```
 
-CPURT17 still writes `cpurt15_output.ppm` by default (legacy filename). Convert to PNG/MP4
+CPURT20 still writes `cpurt15_output.ppm` by default (legacy filename). Convert to PNG/MP4
 with ImageMagick or ffmpeg:
 
 ```bash
@@ -109,10 +110,60 @@ convert cpurt15_output.ppm output.png
 
 # Video sequence → MP4
 mkdir -p frames
-for i in $(seq 0 47); do "./source code/cpurt17" video $i 48; done
+for i in $(seq 0 47); do "./source code/cpurt20" video $i 48; done
 ffmpeg -framerate 24 -i frames/frame_%04d.ppm \
   -vf scale=1280:720:flags=lanczos -c:v libx264 -crf 18 -pix_fmt yuv420p out.mp4
 ```
+
+---
+
+## CPURT20 realtime CPU path
+
+CPURT20 keeps CPURT17's scene, march limits and shading unchanged. The realtime bridge
+(`cpurt_render_buffer()`) uses forward temporal reprojection: each previous visible pixel
+reconstructs its world-space hit point from previous depth and is projected through the current
+camera. A per-pixel atomic claim keeps the nearest candidate. Pixels with no valid candidate
+(disocclusions, animated materials, large view changes) are freshly shaded; valid pixels skip
+the primary march and all shadow/AO/GI/reflection work. Temporally reused lanes are compacted
+before the 8-wide march so they do not occupy SIMD slots. When the camera is unchanged, history
+maps 1:1 and the projection pass is skipped entirely.
+
+This replaced the original gather-style cache lookup, which guessed the current hit from stale
+same-pixel depth. That could accept a previous final colour across a moving silhouette and was
+the source of the reported trailing smearing. Motion guards remain: reprojected pixels may not
+move more than 8 screen pixels, view directions must stay within a small angular delta, and
+high-contrast 3×3 final-colour neighbourhoods are recomputed. Water and animated SDF meshes are
+never reused.
+
+Measured on Ryzen 7 5700X (8 threads, AVX2) at 640×360 internal (1280×720 @ 1/2 scale):
+
+| Workload | CPURT17 | CPURT20 (8 threads) | CPURT20 (12 threads) |
+|----------|---------|---------------------|----------------------|
+| Moving camera | 151.3 ms (6.6 fps) | 13.80 ms (72.5 fps) | 11.10 ms (90.1 fps) |
+| Static camera | 73.5 ms (13.6 fps) | 18.27 ms (54.7 fps) | 13.99 ms (71.5 fps) |
+
+Quality was compared against CPURT17 frames at 640×360. With reuse disabled the MAE is 2.34
+(moving) and 6.46 (static); after a 3×3 blur those drop to ~0.85 and ~2.3, confirming the base
+difference is stochastic shadow/GI noise rather than scene structure. Against a CPURT20 no-reuse
+frame, the final forward-reuse path has MAE 4.29 (normal motion) and 2.66 (fast 0.03 rad/frame
+pan); channels differing by more than 8 are 12.67% and 6.87% respectively. Residual difference
+is stochastic shadow/GI noise from one-frame history, not geometry dragging. Very fast turns
+intentionally reject most reuse, so frame rate drops during those moments; normal motion stays
+above target. GI/shadow/AO history reuse was tested but disabled because it moved stochastic
+highlights too much; final-pixel reuse alone preserves the image much better.
+
+### Debug switches
+
+`bench20` prints temporal-reuse counts. Environment variables (for experiments only):
+
+- `CPURT_NO_REUSE=1` — disable final-pixel reuse.
+- `CPURT_NO_GI_REUSE=1` — disable GI/shadow/AO history (already off by default in the bridge).
+- `CPURT_REUSE_COLOR_TOL` — 3×3 final-colour spread in 8-bit units (default 16).
+- `CPURT_REUSE_VIEW_TOL` — maximum view-direction change (default 0.004).
+- `CPURT_REUSE_MAX_MOVE` / `CPURT_REUSE_SKY_MAX_MOVE` — maximum reprojection distance in pixels
+  for surfaces / sky (default 8 each).
+- `CPURT_BAKED=1` / `CPURT_BOUNDS=1` — enable optional baked-height / height-bound experiments.
+  Both are disabled by default because they measurably change terrain edges.
 
 ---
 
@@ -184,10 +235,11 @@ render_frame()
        bilateral_denoise()           edge-aware spatial denoiser on the final image
 ```
 
-The GI cache (`struct GICache`) stores per-pixel `{gi_r, gi_g, gi_b, depth, mat}`. Each
-frame, the previous frame's GI is reprojected to the current camera; hits that match in
-depth and material are blended (75% cached, 25% new ray). This amortizes the most expensive
-single ray across many frames during animation.
+The cache (`struct GICache`) stores per-pixel GI, shadow, AO, normals, reflection colour,
+final gamma-encoded colour, depth and material. The standalone renderer still reprojects GI
+(75% cached, 25% new ray). CPURT20's realtime bridge uses the same buffers for final-pixel
+reprojection instead; GI history is deliberately not reused there because it visibly moved
+stochastic highlights.
 
 ---
 
